@@ -530,6 +530,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              void** buffer_ptrs,
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens,
+             int64_t* normal_dispatch_final_completion_cost_stats,
+             int64_t* normal_dispatch_final_completion_sample_count_stats,
+             int64_t* normal_dispatch_final_completion_token_count_stats,
              int rank,
              int num_ranks) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
@@ -541,6 +544,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
     const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
+    const bool enable_normal_dispatch_final_completion_stats = normal_dispatch_final_completion_cost_stats != nullptr;
 
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
@@ -1144,6 +1148,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
+        int completion_expected_count = end_offset - start_offset;
+        int completion_recv_count = 0;
+        uint64_t completion_start_time = clock64();
 
         // Save for combine usage
         if (lane_id < kNumRDMARanks and not kCachedMode)
@@ -1181,6 +1188,15 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 auto meta = ld_nc_global(reinterpret_cast<SourceMeta*>(shifted + hidden_bytes + scale_bytes));
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
+                int completion_stats_idx = -1;
+                if (enable_normal_dispatch_final_completion_stats and lane_id == meta.src_rdma_rank and
+                    completion_expected_count > 0) {
+                    completion_recv_count += 1;
+                    if (completion_recv_count == completion_expected_count) {
+                        const auto src_global_rank = lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                        completion_stats_idx = src_global_rank;
+                    }
+                }
 
                 bool scale_aligned = (scale_bytes % 16 == 0);
                 auto tma_load_bytes = hidden_bytes + (scale_aligned ? scale_bytes : 0);
@@ -1235,6 +1251,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 // Wait TMA to be finished
                 tma_store_wait<0>();
                 __syncwarp();
+                if (completion_stats_idx >= 0) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(normal_dispatch_final_completion_cost_stats + completion_stats_idx),
+                              clock64() - completion_start_time);
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_final_completion_sample_count_stats + completion_stats_idx),
+                        1);
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_final_completion_token_count_stats + completion_stats_idx),
+                        static_cast<unsigned long long>(completion_expected_count));
+                }
             }
 
             // Move queue
@@ -1292,6 +1318,9 @@ void dispatch(void* recv_x,
               void** buffer_ptrs,
               int num_max_nvl_chunked_send_tokens,
               int num_max_nvl_chunked_recv_tokens,
+              int64_t* normal_dispatch_final_completion_cost_stats,
+              int64_t* normal_dispatch_final_completion_sample_count_stats,
+              int64_t* normal_dispatch_final_completion_token_count_stats,
               int rank,
               int num_ranks,
               bool is_cached_dispatch,
@@ -1304,6 +1333,9 @@ void dispatch(void* recv_x,
 
     // Make sure never OOB
     EP_HOST_ASSERT(static_cast<int64_t>(num_scales) * scale_hidden_stride < std::numeric_limits<int>::max());
+    const bool enable_normal_dispatch_final_completion_stats = normal_dispatch_final_completion_cost_stats != nullptr;
+    EP_HOST_ASSERT((normal_dispatch_final_completion_sample_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
+    EP_HOST_ASSERT((normal_dispatch_final_completion_token_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                   \
     {                                                                                                                          \
@@ -1347,6 +1379,9 @@ void dispatch(void* recv_x,
                       buffer_ptrs,                                                                                             \
                       num_max_nvl_chunked_send_tokens,                                                                         \
                       num_max_nvl_chunked_recv_tokens,                                                                         \
+                      normal_dispatch_final_completion_cost_stats,                                                             \
+                      normal_dispatch_final_completion_sample_count_stats,                                                     \
+                      normal_dispatch_final_completion_token_count_stats,                                                      \
                       rank,                                                                                                    \
                       num_ranks);                                                                                              \
     }                                                                                                                          \

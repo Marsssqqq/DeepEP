@@ -573,6 +573,12 @@ class Buffer:
                 normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_cached_notify_dispatch_full_kernel_count_stats,
                 self._normal_cached_notify_dispatch_full_kernel_timer_state)
+        normal_dispatch_final_completion_cost_stats = normal_stats[
+            "normal_dispatch_final_completion_cost_stats"]
+        normal_dispatch_final_completion_sample_count_stats = normal_stats[
+            "normal_dispatch_final_completion_sample_count_stats"]
+        normal_dispatch_final_completion_token_count_stats = normal_stats[
+            "normal_dispatch_final_completion_token_count_stats"]
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -585,6 +591,9 @@ class Buffer:
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                normal_dispatch_final_completion_cost_stats,
+                normal_dispatch_final_completion_sample_count_stats,
+                normal_dispatch_final_completion_token_count_stats,
                 normal_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_notify_dispatch_full_kernel_count_stats,
                 normal_notify_dispatch_full_kernel_timer_state,
@@ -603,6 +612,9 @@ class Buffer:
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                normal_dispatch_final_completion_cost_stats,
+                normal_dispatch_final_completion_sample_count_stats,
+                normal_dispatch_final_completion_token_count_stats,
                 normal_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_notify_dispatch_full_kernel_count_stats,
                 normal_notify_dispatch_full_kernel_timer_state,
