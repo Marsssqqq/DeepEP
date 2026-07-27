@@ -173,7 +173,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode);
+                     bool low_latency_mode,
+                     int64_t* normal_notify_dispatch_full_kernel_duration_ns_stats,
+                     int64_t* normal_notify_dispatch_full_kernel_count_stats,
+                     int64_t* normal_notify_dispatch_full_kernel_timer_state);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -235,7 +238,10 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode);
+                   bool low_latency_mode,
+                   int64_t* normal_cached_notify_full_kernel_duration_ns_stats,
+                   int64_t* normal_cached_notify_full_kernel_count_stats,
+                   int64_t* normal_cached_notify_full_kernel_timer_state);
 
 void combine(cudaDataType_t type,
              void* combined_x,

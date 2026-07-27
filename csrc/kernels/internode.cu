@@ -14,6 +14,42 @@ namespace internode {
 
 extern nvshmem_team_t cpu_rdma_team;
 
+__device__ __forceinline__ uint64_t read_globaltimer_ns() {
+    uint64_t value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    return value;
+}
+
+__device__ __forceinline__ void notify_full_kernel_timer_begin(int64_t* timer_state) {
+    if (timer_state == nullptr)
+        return;
+
+    if (threadIdx.x == 0) {
+        auto state = reinterpret_cast<unsigned long long*>(timer_state);
+        atomicMax(state, ~read_globaltimer_ns());
+    }
+    __syncthreads();
+}
+
+__device__ __forceinline__ void notify_full_kernel_timer_end(int64_t* timer_state,
+                                                             int64_t* duration_ns_stats,
+                                                             int64_t* count_stats) {
+    if (timer_state == nullptr)
+        return;
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        auto state = reinterpret_cast<unsigned long long*>(timer_state);
+        auto completed_blocks = atomicAdd(state + 1, 1ull);
+        if (completed_blocks + 1 == gridDim.x) {
+            auto inverted_start = atomicAdd(state, 0ull);
+            auto duration_ns = read_globaltimer_ns() - ~inverted_start;
+            atomicAdd(reinterpret_cast<unsigned long long*>(duration_ns_stats), duration_ns);
+            atomicAdd(reinterpret_cast<unsigned long long*>(count_stats), 1ull);
+        }
+    }
+}
+
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
@@ -115,13 +151,18 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 void** buffer_ptrs,
                                 int** barrier_signal_ptrs,
                                 int rank,
-                                const nvshmem_team_t rdma_team) {
+                                const nvshmem_team_t rdma_team,
+                                int64_t* normal_notify_dispatch_full_kernel_duration_ns_stats,
+                                int64_t* normal_notify_dispatch_full_kernel_count_stats,
+                                int64_t* normal_notify_dispatch_full_kernel_timer_state) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
 
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_experts = num_experts / kNumRDMARanks, num_nvl_experts = num_rdma_experts / NUM_MAX_NVL_PEERS;
+
+    notify_full_kernel_timer_begin(normal_notify_dispatch_full_kernel_timer_state);
 
     if (sm_id == 0) {
         // Communication with others
@@ -341,6 +382,10 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                 prefix_row[i] += prefix_row[i - 1];
         }
     }
+
+    notify_full_kernel_timer_end(normal_notify_dispatch_full_kernel_timer_state,
+                                 normal_notify_dispatch_full_kernel_duration_ns_stats,
+                                 normal_notify_dispatch_full_kernel_count_stats);
 }
 
 void notify_dispatch(const int* num_tokens_per_rank,
@@ -372,7 +417,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      cudaStream_t stream,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
-                     bool low_latency_mode) {
+                     bool low_latency_mode,
+                     int64_t* normal_notify_dispatch_full_kernel_duration_ns_stats,
+                     int64_t* normal_notify_dispatch_full_kernel_count_stats,
+                     int64_t* normal_notify_dispatch_full_kernel_timer_state) {
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                    \
     {                                                                                                                                  \
         auto notify_dispatch_func = low_latency_mode ? notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
@@ -403,7 +451,10 @@ void notify_dispatch(const int* num_tokens_per_rank,
                       buffer_ptrs,                                                                                                     \
                       barrier_signal_ptrs,                                                                                             \
                       rank,                                                                                                            \
-                      cpu_rdma_team);                                                                                                  \
+                      cpu_rdma_team,                                                                                                   \
+                      normal_notify_dispatch_full_kernel_duration_ns_stats,                                                            \
+                      normal_notify_dispatch_full_kernel_count_stats,                                                                  \
+                      normal_notify_dispatch_full_kernel_timer_state);                                                                 \
     }                                                                                                                                  \
     break
 
@@ -429,6 +480,8 @@ void notify_dispatch(const int* num_tokens_per_rank,
 
     // Launch kernel
     SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
+    if (normal_notify_dispatch_full_kernel_timer_state != nullptr)
+        CUDA_CHECK(cudaMemsetAsync(normal_notify_dispatch_full_kernel_timer_state, 0, 2 * sizeof(int64_t), stream));
     SWITCH_RDMA_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
 #undef NOTIFY_DISPATCH_LAUNCH_CASE
 }
@@ -1324,7 +1377,10 @@ __global__ void cached_notify(const int rdma_clean_offset,
                               int rank,
                               int num_ranks,
                               bool is_cached_dispatch,
-                              const nvshmem_team_t rdma_team) {
+                              const nvshmem_team_t rdma_team,
+                              int64_t* normal_cached_notify_full_kernel_duration_ns_stats,
+                              int64_t* normal_cached_notify_full_kernel_count_stats,
+                              int64_t* normal_cached_notify_full_kernel_timer_state) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
@@ -1335,6 +1391,8 @@ __global__ void cached_notify(const int rdma_clean_offset,
     auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS;
+
+    notify_full_kernel_timer_begin(normal_cached_notify_full_kernel_timer_state);
 
     // Using two SMs, which clean the RDMA/NVL buffer respectively
     if (sm_id == 0) {
@@ -1371,100 +1429,102 @@ __global__ void cached_notify(const int rdma_clean_offset,
             nvshmem_sync_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
         barrier_block<NUM_MAX_NVL_PEERS>(barrier_signal_ptrs, nvl_rank);
     } else if (sm_id == 1) {
-        if (is_cached_dispatch)
-            return;
+        if (not is_cached_dispatch) {
+            EP_DEVICE_ASSERT(num_warps >= num_channels);
+            EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
 
-        EP_DEVICE_ASSERT(num_warps >= num_channels);
-        EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
+            // Iterate in reverse order
+            if (lane_id < num_rdma_ranks and warp_id < num_channels) {
+                int token_start_idx, token_end_idx;
+                get_channel_task_range(num_combined_tokens, num_channels, warp_id, token_start_idx, token_end_idx);
 
-        // Iterate in reverse order
-        if (lane_id < num_rdma_ranks and warp_id < num_channels) {
-            int token_start_idx, token_end_idx;
-            get_channel_task_range(num_combined_tokens, num_channels, warp_id, token_start_idx, token_end_idx);
-
-            // NOTES: `1 << 25` is a heuristic large number
-            int last_head = 1 << 25;
-            for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
-                auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
-                if (current_head < 0) {
-                    combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
-                } else {
-                    last_head = current_head;
+                // NOTES: `1 << 25` is a heuristic large number
+                int last_head = 1 << 25;
+                for (int token_idx = token_end_idx - 1; token_idx >= token_start_idx; --token_idx) {
+                    auto current_head = __ldg(combined_rdma_head + token_idx * num_rdma_ranks + lane_id);
+                    if (current_head < 0) {
+                        combined_rdma_head[token_idx * num_rdma_ranks + lane_id] = -last_head - 1;
+                    } else {
+                        last_head = current_head;
+                    }
                 }
             }
         }
     } else {
-        if (is_cached_dispatch)
-            return;
+        if (not is_cached_dispatch) {
+            EP_DEVICE_ASSERT(num_warps >= num_channels);
+            EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
+            EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Too many NVL peers");
 
-        EP_DEVICE_ASSERT(num_warps >= num_channels);
-        EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Too many NVL peers");
+            if (warp_id < num_channels) {
+                constexpr int tma_batch_size = kNumTMABytesPerWarp - sizeof(uint64_t);
+                constexpr int num_bytes_per_token = sizeof(int) * NUM_MAX_NVL_PEERS;
+                constexpr int num_tokens_per_batch = tma_batch_size / num_bytes_per_token;
+                EP_STATIC_ASSERT(num_bytes_per_token % 16 == 0, "num_bytes_per_token should be divisible by 16");
 
-        if (warp_id < num_channels) {
-            constexpr int tma_batch_size = kNumTMABytesPerWarp - sizeof(uint64_t);
-            constexpr int num_bytes_per_token = sizeof(int) * NUM_MAX_NVL_PEERS;
-            constexpr int num_tokens_per_batch = tma_batch_size / num_bytes_per_token;
-            EP_STATIC_ASSERT(num_bytes_per_token % 16 == 0, "num_bytes_per_token should be divisible by 16");
+                // TMA stuffs
+                extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
+                auto tma_buffer = smem_tma_buffer + warp_id * kNumTMABytesPerWarp;
+                auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + tma_batch_size);
+                uint32_t tma_phase = 0;
+                if (elect_one_sync()) {
+                    mbarrier_init(tma_mbarrier, 1);
+                    fence_barrier_init();
+                }
+                __syncwarp();
 
-            // TMA stuffs
-            extern __shared__ __align__(1024) uint8_t smem_tma_buffer[];
-            auto tma_buffer = smem_tma_buffer + warp_id * kNumTMABytesPerWarp;
-            auto tma_mbarrier = reinterpret_cast<uint64_t*>(tma_buffer + tma_batch_size);
-            uint32_t tma_phase = 0;
-            if (elect_one_sync()) {
-                mbarrier_init(tma_mbarrier, 1);
-                fence_barrier_init();
-            }
-            __syncwarp();
+                for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 2) {
+                    // Iterate in reverse order
+                    int token_start_idx = warp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id - 1];
+                    int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
+                    int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
+                    token_start_idx += shift, token_end_idx += shift;
 
-            for (int dst_rdma_rank = sm_id - 2; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 2) {
-                // Iterate in reverse order
-                int token_start_idx = warp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id - 1];
-                int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
-                int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
-                token_start_idx += shift, token_end_idx += shift;
+                    // NOTES: `1 << 25` is a heuristic large number
+                    int last_head = 1 << 25;
+                    for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx; batch_end_idx -= num_tokens_per_batch) {
+                        auto batch_start_idx = max(token_start_idx, batch_end_idx - num_tokens_per_batch);
 
-                // NOTES: `1 << 25` is a heuristic large number
-                int last_head = 1 << 25;
-                for (int batch_end_idx = token_end_idx; batch_end_idx > token_start_idx; batch_end_idx -= num_tokens_per_batch) {
-                    auto batch_start_idx = max(token_start_idx, batch_end_idx - num_tokens_per_batch);
+                        if (elect_one_sync()) {
+                            tma_load_1d(tma_buffer,
+                                        combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
+                                        tma_mbarrier,
+                                        (batch_end_idx - batch_start_idx) * num_bytes_per_token);
+                            mbarrier_arrive_and_expect_tx(tma_mbarrier, (batch_end_idx - batch_start_idx) * num_bytes_per_token);
+                        }
+                        mbarrier_wait(tma_mbarrier, tma_phase);
+                        __syncwarp();
 
-                    if (elect_one_sync()) {
-                        tma_load_1d(tma_buffer,
-                                    combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
-                                    tma_mbarrier,
-                                    (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-                        mbarrier_arrive_and_expect_tx(tma_mbarrier, (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-                    }
-                    mbarrier_wait(tma_mbarrier, tma_phase);
-                    __syncwarp();
-
-                    for (int token_idx = batch_end_idx - 1; token_idx >= batch_start_idx; --token_idx) {
-                        if (lane_id < NUM_MAX_NVL_PEERS) {
-                            auto current_head =
-                                reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
-                            if (current_head < 0) {
-                                reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
-                                    -last_head - 1;
-                            } else {
-                                last_head = current_head;
+                        for (int token_idx = batch_end_idx - 1; token_idx >= batch_start_idx; --token_idx) {
+                            if (lane_id < NUM_MAX_NVL_PEERS) {
+                                auto current_head =
+                                    reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id];
+                                if (current_head < 0) {
+                                    reinterpret_cast<int*>(tma_buffer)[(token_idx - batch_start_idx) * NUM_MAX_NVL_PEERS + lane_id] =
+                                        -last_head - 1;
+                                } else {
+                                    last_head = current_head;
+                                }
                             }
                         }
-                    }
-                    tma_store_fence();
-                    __syncwarp();
+                        tma_store_fence();
+                        __syncwarp();
 
-                    if (elect_one_sync())
-                        tma_store_1d(tma_buffer,
-                                     combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
-                                     (batch_end_idx - batch_start_idx) * num_bytes_per_token);
-                    tma_store_wait<0>();
-                    __syncwarp();
+                        if (elect_one_sync())
+                            tma_store_1d(tma_buffer,
+                                         combined_nvl_head + batch_start_idx * NUM_MAX_NVL_PEERS,
+                                         (batch_end_idx - batch_start_idx) * num_bytes_per_token);
+                        tma_store_wait<0>();
+                        __syncwarp();
+                    }
                 }
             }
         }
     }
+
+    notify_full_kernel_timer_end(normal_cached_notify_full_kernel_timer_state,
+                                 normal_cached_notify_full_kernel_duration_ns_stats,
+                                 normal_cached_notify_full_kernel_count_stats);
 }
 
 void cached_notify(int hidden_int4,
@@ -1488,7 +1548,10 @@ void cached_notify(int hidden_int4,
                    int64_t num_rdma_bytes,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
-                   bool low_latency_mode) {
+                   bool low_latency_mode,
+                   int64_t* normal_cached_notify_full_kernel_duration_ns_stats,
+                   int64_t* normal_cached_notify_full_kernel_count_stats,
+                   int64_t* normal_cached_notify_full_kernel_timer_state) {
     const int num_threads = std::max(128, 32 * num_channels);
     const int num_warps = num_threads / 32;
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
@@ -1517,6 +1580,8 @@ void cached_notify(int hidden_int4,
     auto cached_notify_func = low_latency_mode ? cached_notify<true, kNumTMABytesPerWarp> : cached_notify<false, kNumTMABytesPerWarp>;
     SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
     SET_SHARED_MEMORY_FOR_TMA(cached_notify_func);
+    if (normal_cached_notify_full_kernel_timer_state != nullptr)
+        CUDA_CHECK(cudaMemsetAsync(normal_cached_notify_full_kernel_timer_state, 0, 2 * sizeof(int64_t), stream));
     LAUNCH_KERNEL(&cfg,
                   cached_notify_func,
                   rdma_clean_meta.first,
@@ -1535,7 +1600,10 @@ void cached_notify(int hidden_int4,
                   rank,
                   num_ranks,
                   is_cached_dispatch,
-                  cpu_rdma_team);
+                  cpu_rdma_team,
+                  normal_cached_notify_full_kernel_duration_ns_stats,
+                  normal_cached_notify_full_kernel_count_stats,
+                  normal_cached_notify_full_kernel_timer_state);
 }
 
 template <int kNumRanks,

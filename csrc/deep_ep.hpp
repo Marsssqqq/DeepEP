@@ -235,7 +235,13 @@ public:
                        const Config& config,
                        std::optional<EventHandle>& previous_event,
                        bool async,
-                       bool allocate_on_comm_stream);
+                       bool allocate_on_comm_stream,
+                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
+                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats = std::nullopt,
+                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_timer_state = std::nullopt,
+                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
+                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats = std::nullopt,
+                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_timer_state = std::nullopt);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
         const torch::Tensor& x,
@@ -252,7 +258,10 @@ public:
         const Config& config,
         std::optional<EventHandle>& previous_event,
         bool async,
-        bool allocate_on_comm_stream);
+        bool allocate_on_comm_stream,
+        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats = std::nullopt,
+        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats = std::nullopt,
+        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state = std::nullopt);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 

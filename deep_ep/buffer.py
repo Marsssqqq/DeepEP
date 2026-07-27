@@ -117,6 +117,10 @@ class Buffer:
         self._normal_diagnose_stats = {
             name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA
         }
+        self._normal_notify_full_kernel_timer_states = None
+        self._normal_notify_dispatch_full_kernel_timer_state = None
+        self._normal_cached_notify_dispatch_full_kernel_timer_state = None
+        self._normal_cached_notify_combine_full_kernel_timer_state = None
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -171,6 +175,33 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+
+    def _initialize_normal_notify_timer_states(self) -> None:
+        """Create persistent per-launch notify timer scratch owned by DeepEP.
+
+        Each row is ``[inverted earliest start, completed blocks]``. C++ resets
+        the selected row on the communication stream immediately before the
+        corresponding kernel launch, so the pointers remain CUDA-graph stable.
+        """
+        self._normal_notify_full_kernel_timer_states = torch.zeros(
+            (3, 2), dtype=torch.int64, device="cuda")
+        self._normal_notify_dispatch_full_kernel_timer_state = \
+            self._normal_notify_full_kernel_timer_states[0]
+        self._normal_cached_notify_dispatch_full_kernel_timer_state = \
+            self._normal_notify_full_kernel_timer_states[1]
+        self._normal_cached_notify_combine_full_kernel_timer_state = \
+            self._normal_notify_full_kernel_timer_states[2]
+
+    @staticmethod
+    def _select_normal_notify_timer_state(
+            duration_stats: Optional[torch.Tensor],
+            count_stats: Optional[torch.Tensor],
+            timer_state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if (duration_stats is None) != (count_stats is None):
+            raise RuntimeError(
+                "DeepXTrace notify duration/count tensors must be enabled "
+                "or disabled together")
+        return timer_state if duration_stats is not None else None
 
     def _get_normal_diagnose_stats(
             self) -> Dict[str, Optional[torch.Tensor]]:
@@ -523,6 +554,25 @@ class Buffer:
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
+        normal_stats = self._normal_diagnose_stats
+        normal_notify_dispatch_full_kernel_duration_ns_stats = normal_stats[
+            "normal_notify_dispatch_full_kernel_duration_ns_stats"]
+        normal_notify_dispatch_full_kernel_count_stats = normal_stats[
+            "normal_notify_dispatch_full_kernel_count_stats"]
+        normal_notify_dispatch_full_kernel_timer_state = \
+            self._select_normal_notify_timer_state(
+                normal_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_notify_dispatch_full_kernel_count_stats,
+                self._normal_notify_dispatch_full_kernel_timer_state)
+        normal_cached_notify_dispatch_full_kernel_duration_ns_stats = normal_stats[
+            "normal_cached_notify_dispatch_full_kernel_duration_ns_stats"]
+        normal_cached_notify_dispatch_full_kernel_count_stats = normal_stats[
+            "normal_cached_notify_dispatch_full_kernel_count_stats"]
+        normal_cached_notify_dispatch_full_kernel_timer_state = \
+            self._select_normal_notify_timer_state(
+                normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_cached_notify_dispatch_full_kernel_count_stats,
+                self._normal_cached_notify_dispatch_full_kernel_timer_state)
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -534,7 +584,13 @@ class Buffer:
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = self.runtime.internode_dispatch(
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum, gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                normal_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_notify_dispatch_full_kernel_count_stats,
+                normal_notify_dispatch_full_kernel_timer_state,
+                normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_cached_notify_dispatch_full_kernel_count_stats,
+                normal_cached_notify_dispatch_full_kernel_timer_state)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -546,7 +602,13 @@ class Buffer:
                 x, x_scales, topk_idx, topk_weights,
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
-                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream)
+                expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
+                normal_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_notify_dispatch_full_kernel_count_stats,
+                normal_notify_dispatch_full_kernel_timer_state,
+                normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
+                normal_cached_notify_dispatch_full_kernel_count_stats,
+                normal_cached_notify_dispatch_full_kernel_timer_state)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
@@ -575,6 +637,16 @@ class Buffer:
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, gbl_rank_prefix_sum, \
             src_meta, send_rdma_head, send_nvl_head = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
+        normal_stats = self._normal_diagnose_stats
+        normal_cached_notify_combine_full_kernel_duration_ns_stats = normal_stats[
+            "normal_cached_notify_combine_full_kernel_duration_ns_stats"]
+        normal_cached_notify_combine_full_kernel_count_stats = normal_stats[
+            "normal_cached_notify_combine_full_kernel_count_stats"]
+        normal_cached_notify_combine_full_kernel_timer_state = \
+            self._select_normal_notify_timer_state(
+                normal_cached_notify_combine_full_kernel_duration_ns_stats,
+                normal_cached_notify_combine_full_kernel_count_stats,
+                self._normal_cached_notify_combine_full_kernel_timer_state)
 
         # Launch the kernel
         combined_x, combined_topk_weights, event = self.runtime.internode_combine(x, topk_weights, bias_0, bias_1, src_meta,
@@ -582,7 +654,10 @@ class Buffer:
                                                                                   rdma_rank_prefix_sum, gbl_channel_prefix_matrix,
                                                                                   send_rdma_head, send_nvl_head, config,
                                                                                   getattr(previous_event, 'event',
-                                                                                          None), async_finish, allocate_on_comm_stream)
+                                                                                          None), async_finish, allocate_on_comm_stream,
+                                                                                  normal_cached_notify_combine_full_kernel_duration_ns_stats,
+                                                                                  normal_cached_notify_combine_full_kernel_count_stats,
+                                                                                  normal_cached_notify_combine_full_kernel_timer_state)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:

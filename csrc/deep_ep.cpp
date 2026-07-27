@@ -946,7 +946,13 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const Config& config,
                            std::optional<EventHandle>& previous_event,
                            bool async,
-                           bool allocate_on_comm_stream) {
+                           bool allocate_on_comm_stream,
+                           const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats,
+                           const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats,
+                           const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_timer_state,
+                           const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
+                           const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats,
+                           const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_timer_state) {
 #ifndef DISABLE_NVSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1004,6 +1010,26 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
     }
+    auto check_normal_notify_stats = [](const std::optional<torch::Tensor>& duration_ns_stats,
+                                        const std::optional<torch::Tensor>& count_stats,
+                                        const std::optional<torch::Tensor>& timer_state) {
+        const bool enabled = duration_ns_stats.has_value();
+        EP_HOST_ASSERT(count_stats.has_value() == enabled and timer_state.has_value() == enabled);
+        if (enabled) {
+            EP_HOST_ASSERT(duration_ns_stats->scalar_type() == torch::kInt64 and count_stats->scalar_type() == torch::kInt64 and
+                           timer_state->scalar_type() == torch::kInt64);
+            EP_HOST_ASSERT(duration_ns_stats->dim() == 1 and duration_ns_stats->numel() == 1 and
+                           duration_ns_stats->is_contiguous());
+            EP_HOST_ASSERT(count_stats->dim() == 1 and count_stats->numel() == 1 and count_stats->is_contiguous());
+            EP_HOST_ASSERT(timer_state->dim() == 1 and timer_state->numel() == 2 and timer_state->is_contiguous());
+        }
+    };
+    check_normal_notify_stats(normal_notify_dispatch_full_kernel_duration_ns_stats,
+                              normal_notify_dispatch_full_kernel_count_stats,
+                              normal_notify_dispatch_full_kernel_timer_state);
+    check_normal_notify_stats(normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
+                              normal_cached_notify_dispatch_full_kernel_count_stats,
+                              normal_cached_notify_dispatch_full_kernel_timer_state);
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1)),
          hidden_int4 = static_cast<int>(x.size(1) * x.element_size() / sizeof(int4));
@@ -1094,7 +1120,16 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                  num_nvl_bytes,
                                  true,
-                                 low_latency_mode);
+                                 low_latency_mode,
+                                 normal_cached_notify_dispatch_full_kernel_duration_ns_stats.has_value()
+                                     ? normal_cached_notify_dispatch_full_kernel_duration_ns_stats->data_ptr<int64_t>()
+                                     : nullptr,
+                                 normal_cached_notify_dispatch_full_kernel_count_stats.has_value()
+                                     ? normal_cached_notify_dispatch_full_kernel_count_stats->data_ptr<int64_t>()
+                                     : nullptr,
+                                 normal_cached_notify_dispatch_full_kernel_timer_state.has_value()
+                                     ? normal_cached_notify_dispatch_full_kernel_timer_state->data_ptr<int64_t>()
+                                     : nullptr);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1134,7 +1169,16 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    comm_stream,
                                    config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                                    num_nvl_bytes,
-                                   low_latency_mode);
+                                   low_latency_mode,
+                                   normal_notify_dispatch_full_kernel_duration_ns_stats.has_value()
+                                       ? normal_notify_dispatch_full_kernel_duration_ns_stats->data_ptr<int64_t>()
+                                       : nullptr,
+                                   normal_notify_dispatch_full_kernel_count_stats.has_value()
+                                       ? normal_notify_dispatch_full_kernel_count_stats->data_ptr<int64_t>()
+                                       : nullptr,
+                                   normal_notify_dispatch_full_kernel_timer_state.has_value()
+                                       ? normal_notify_dispatch_full_kernel_timer_state->data_ptr<int64_t>()
+                                       : nullptr);
 
         // Synchronize total received tokens and tokens per expert
         if (num_worst_tokens > 0) {
@@ -1324,7 +1368,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     const Config& config,
     std::optional<EventHandle>& previous_event,
     bool async,
-    bool allocate_on_comm_stream) {
+    bool allocate_on_comm_stream,
+    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats,
+    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats,
+    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state) {
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1356,6 +1403,23 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     EP_HOST_ASSERT(combined_rdma_head.dim() == 2 and combined_rdma_head.size(0) == num_combined_tokens and
                    combined_rdma_head.size(1) == num_rdma_ranks);
     EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
+    const bool normal_cached_notify_combine_enabled = normal_cached_notify_combine_full_kernel_duration_ns_stats.has_value();
+    EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_count_stats.has_value() == normal_cached_notify_combine_enabled and
+                   normal_cached_notify_combine_full_kernel_timer_state.has_value() == normal_cached_notify_combine_enabled);
+    if (normal_cached_notify_combine_enabled) {
+        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_duration_ns_stats->scalar_type() == torch::kInt64 and
+                       normal_cached_notify_combine_full_kernel_count_stats->scalar_type() == torch::kInt64 and
+                       normal_cached_notify_combine_full_kernel_timer_state->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_duration_ns_stats->dim() == 1 and
+                       normal_cached_notify_combine_full_kernel_duration_ns_stats->numel() == 1 and
+                       normal_cached_notify_combine_full_kernel_duration_ns_stats->is_contiguous());
+        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_count_stats->dim() == 1 and
+                       normal_cached_notify_combine_full_kernel_count_stats->numel() == 1 and
+                       normal_cached_notify_combine_full_kernel_count_stats->is_contiguous());
+        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_timer_state->dim() == 1 and
+                       normal_cached_notify_combine_full_kernel_timer_state->numel() == 2 and
+                       normal_cached_notify_combine_full_kernel_timer_state->is_contiguous());
+    }
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
@@ -1413,7 +1477,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
                              num_nvl_bytes,
                              false,
-                             low_latency_mode);
+                             low_latency_mode,
+                             normal_cached_notify_combine_enabled
+                                 ? normal_cached_notify_combine_full_kernel_duration_ns_stats->data_ptr<int64_t>()
+                                 : nullptr,
+                             normal_cached_notify_combine_enabled
+                                 ? normal_cached_notify_combine_full_kernel_count_stats->data_ptr<int64_t>()
+                                 : nullptr,
+                             normal_cached_notify_combine_enabled
+                                 ? normal_cached_notify_combine_full_kernel_timer_state->data_ptr<int64_t>()
+                                 : nullptr);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
