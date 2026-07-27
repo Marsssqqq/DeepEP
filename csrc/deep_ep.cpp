@@ -1425,7 +1425,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     bool allocate_on_comm_stream,
     const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats,
     const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats,
-    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state) {
+    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state,
+    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_cost_stats,
+    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_sample_count_stats,
+    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_token_count_stats) {
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1473,6 +1476,21 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_timer_state->dim() == 1 and
                        normal_cached_notify_combine_full_kernel_timer_state->numel() == 2 and
                        normal_cached_notify_combine_full_kernel_timer_state->is_contiguous());
+    }
+    const bool enable_normal_combine_logical_recv_completion_stats =
+        normal_combine_logical_recv_completion_cost_stats.has_value();
+    EP_HOST_ASSERT(normal_combine_logical_recv_completion_sample_count_stats.has_value() ==
+                   enable_normal_combine_logical_recv_completion_stats);
+    EP_HOST_ASSERT(normal_combine_logical_recv_completion_token_count_stats.has_value() ==
+                   enable_normal_combine_logical_recv_completion_stats);
+    for (const auto& stats : {normal_combine_logical_recv_completion_cost_stats,
+                              normal_combine_logical_recv_completion_sample_count_stats,
+                              normal_combine_logical_recv_completion_token_count_stats}) {
+        if (stats.has_value()) {
+            EP_HOST_ASSERT(stats->scalar_type() == torch::kInt64);
+            EP_HOST_ASSERT(stats->dim() == 1 and stats->is_contiguous());
+            EP_HOST_ASSERT(stats->numel() == num_ranks);
+        }
     }
 
     // Allocate all tensors on comm stream if set
@@ -1580,6 +1598,15 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        buffer_ptrs_gpu,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens,
+                       normal_combine_logical_recv_completion_cost_stats.has_value()
+                           ? normal_combine_logical_recv_completion_cost_stats->data_ptr<int64_t>()
+                           : nullptr,
+                       normal_combine_logical_recv_completion_sample_count_stats.has_value()
+                           ? normal_combine_logical_recv_completion_sample_count_stats->data_ptr<int64_t>()
+                           : nullptr,
+                       normal_combine_logical_recv_completion_token_count_stats.has_value()
+                           ? normal_combine_logical_recv_completion_token_count_stats->data_ptr<int64_t>()
+                           : nullptr,
                        rank,
                        num_ranks,
                        comm_stream,

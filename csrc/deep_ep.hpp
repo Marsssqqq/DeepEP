@@ -267,7 +267,10 @@ public:
         bool allocate_on_comm_stream,
         const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats = std::nullopt,
         const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state = std::nullopt);
+        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state = std::nullopt,
+        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_cost_stats = std::nullopt,
+        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_sample_count_stats = std::nullopt,
+        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_token_count_stats = std::nullopt);
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 

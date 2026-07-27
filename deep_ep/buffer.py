@@ -671,6 +671,12 @@ class Buffer:
                 normal_cached_notify_combine_full_kernel_duration_ns_stats,
                 normal_cached_notify_combine_full_kernel_count_stats,
                 self._normal_cached_notify_combine_full_kernel_timer_state)
+        normal_combine_logical_recv_completion_cost_stats = normal_stats[
+            "normal_combine_logical_recv_completion_cost_stats"]
+        normal_combine_logical_recv_completion_sample_count_stats = normal_stats[
+            "normal_combine_logical_recv_completion_sample_count_stats"]
+        normal_combine_logical_recv_completion_token_count_stats = normal_stats[
+            "normal_combine_logical_recv_completion_token_count_stats"]
 
         # Launch the kernel
         combined_x, combined_topk_weights, event = self.runtime.internode_combine(x, topk_weights, bias_0, bias_1, src_meta,
@@ -681,7 +687,10 @@ class Buffer:
                                                                                           None), async_finish, allocate_on_comm_stream,
                                                                                   normal_cached_notify_combine_full_kernel_duration_ns_stats,
                                                                                   normal_cached_notify_combine_full_kernel_count_stats,
-                                                                                  normal_cached_notify_combine_full_kernel_timer_state)
+                                                                                  normal_cached_notify_combine_full_kernel_timer_state,
+                                                                                  normal_combine_logical_recv_completion_cost_stats,
+                                                                                  normal_combine_logical_recv_completion_sample_count_stats,
+                                                                                  normal_combine_logical_recv_completion_token_count_stats)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:

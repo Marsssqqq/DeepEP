@@ -1929,6 +1929,9 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                                                                         void** buffer_ptrs,
                                                                         int num_max_nvl_chunked_send_tokens,
                                                                         int num_max_nvl_chunked_recv_tokens,
+                                                                        int64_t* normal_combine_logical_recv_completion_cost_stats,
+                                                                        int64_t* normal_combine_logical_recv_completion_sample_count_stats,
+                                                                        int64_t* normal_combine_logical_recv_completion_token_count_stats,
                                                                         int rank,
                                                                         int num_ranks) {
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
@@ -2415,6 +2418,43 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                 rdma_receiver_retired[warp_id] = true;
         } else {
             // Coordinator
+            const bool enable_logical_completion = normal_combine_logical_recv_completion_cost_stats != nullptr and
+                                                   normal_combine_logical_recv_completion_sample_count_stats != nullptr and
+                                                   normal_combine_logical_recv_completion_token_count_stats != nullptr;
+            int logical_expected_count[NUM_MAX_NVL_PEERS] = {0};
+            int logical_last_expected_head[NUM_MAX_NVL_PEERS];
+            uint32_t logical_expected_mask = 0, logical_recorded_mask = 0;
+            uint64_t logical_completion_start_time = 0;
+            #pragma unroll
+            for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+                logical_last_expected_head[i] = -1;
+
+            // Recover logical global-rank dependencies from the dispatch routing bitmap.
+            // One coordinator lane owns one source RDMA rank and its eight NVL ranks.
+            if (not is_forwarder_sm and enable_logical_completion and lane_id < kNumRDMARanks) {
+                int token_start_idx, token_end_idx;
+                get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
+                for (int token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
+                    const auto src_rank_mask = __ldg(reinterpret_cast<const uint64_t*>(
+                        is_combined_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                    if (src_rank_mask == 0)
+                        continue;
+                    const auto expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + lane_id);
+                    EP_DEVICE_ASSERT(expected_head >= 0);
+                    #pragma unroll
+                    for (int src_nvl_rank = 0; src_nvl_rank < NUM_MAX_NVL_PEERS; ++src_nvl_rank) {
+                        const auto src_bit = 1u << src_nvl_rank;
+                        if (((src_rank_mask >> (src_nvl_rank * 8)) & 0xffu) != 0) {
+                            logical_expected_count[src_nvl_rank] += 1;
+                            logical_last_expected_head[src_nvl_rank] =
+                                max(logical_last_expected_head[src_nvl_rank], expected_head);
+                            logical_expected_mask |= src_bit;
+                        }
+                    }
+                }
+                logical_completion_start_time = clock64();
+            }
+
             // Sync shared memory status
             is_forwarder_sm ? sync_forwarder_smem() : sync_rdma_receiver_smem();
             const auto num_warps_per_rdma_rank = kNumForwarders / kNumRDMARanks;
@@ -2425,6 +2465,32 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
             int dst_nvl_rank = lane_id < NUM_MAX_NVL_PEERS ? lane_id : 0;
             EP_STATIC_ASSERT(kNumCombineForwarderWarps <= 32, "Invalid number of forwarder warps");
             while (true) {
+                // A logical source is complete once the node-level RDMA queue has
+                // published the last row that can contain that source's contribution.
+                if (not is_forwarder_sm and enable_logical_completion and lane_id < kNumRDMARanks and
+                    logical_recorded_mask != logical_expected_mask) {
+                    const auto observed_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+                    const auto completion_end_time = clock64();
+                    #pragma unroll
+                    for (int src_nvl_rank = 0; src_nvl_rank < NUM_MAX_NVL_PEERS; ++src_nvl_rank) {
+                        const auto src_bit = 1u << src_nvl_rank;
+                        if ((logical_expected_mask & src_bit) != 0 and (logical_recorded_mask & src_bit) == 0 and
+                            observed_tail > logical_last_expected_head[src_nvl_rank]) {
+                            const auto src_global_rank = lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                          normal_combine_logical_recv_completion_cost_stats + src_global_rank),
+                                      completion_end_time - logical_completion_start_time);
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                          normal_combine_logical_recv_completion_sample_count_stats + src_global_rank),
+                                      1);
+                            atomicAdd(reinterpret_cast<unsigned long long*>(
+                                          normal_combine_logical_recv_completion_token_count_stats + src_global_rank),
+                                      static_cast<unsigned long long>(logical_expected_count[src_nvl_rank]));
+                            logical_recorded_mask |= src_bit;
+                        }
+                    }
+                }
+
                 // Retired
                 if (not is_forwarder_sm and __all_sync(0xffffffff, lane_id >= kNumRDMAReceivers or rdma_receiver_retired[lane_id]))
                     break;
@@ -2492,6 +2558,9 @@ void combine(cudaDataType_t type,
              void** buffer_ptrs,
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens,
+             int64_t* normal_combine_logical_recv_completion_cost_stats,
+             int64_t* normal_combine_logical_recv_completion_sample_count_stats,
+             int64_t* normal_combine_logical_recv_completion_token_count_stats,
              int rank,
              int num_ranks,
              cudaStream_t stream,
@@ -2543,6 +2612,9 @@ void combine(cudaDataType_t type,
                       buffer_ptrs,                                                    \
                       num_max_nvl_chunked_send_tokens,                                \
                       num_max_nvl_chunked_recv_tokens,                                \
+                      normal_combine_logical_recv_completion_cost_stats,              \
+                      normal_combine_logical_recv_completion_sample_count_stats,      \
+                      normal_combine_logical_recv_completion_token_count_stats,       \
                       rank,                                                           \
                       num_ranks);                                                     \
     }                                                                                 \
