@@ -1,4 +1,6 @@
+import importlib
 import os
+import warnings
 import torch
 import torch.distributed as dist
 from typing import Callable, Dict, List, Tuple, Optional, Union
@@ -39,6 +41,24 @@ def _validate_deepxtrace_normal_stats_schema(diagnose_module) -> None:
             f"{actual_schema!r}")
 
 
+def _load_deepxtrace(enable_deepxtrace: bool, has_torch_group: bool):
+    if not isinstance(enable_deepxtrace, bool):
+        raise TypeError("`enable_deepxtrace` must be a bool")
+    if not enable_deepxtrace:
+        return None, "disabled by configuration"
+    if not has_torch_group:
+        return None, (
+            "the current DeepXTrace integration requires a "
+            "torch.distributed process group")
+
+    try:
+        diagnose_module = importlib.import_module("deepxtrace.diagnose")
+        _validate_deepxtrace_normal_stats_schema(diagnose_module)
+    except (ImportError, RuntimeError) as exc:
+        return None, str(exc)
+    return diagnose_module, None
+
+
 class Buffer:
     """
     The core expert-parallel (EP) communication buffers for Mixture of Experts (MoE) model, which supports:
@@ -62,14 +82,16 @@ class Buffer:
                  group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0,
                  num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = False,
+                 low_latency_mode: bool = True,
                  num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
                  use_fabric: bool = False,
                  explicitly_destroy: bool = False,
                  enable_shrink: bool = False,
-                 comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
+                 comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
+                 enable_deepxtrace: bool = True,
+                 enable_deepxtrace_async: bool = True) -> None:
         """
         Initialize the communication buffer.
 
@@ -91,8 +113,19 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
+            enable_deepxtrace: automatically enable DeepXTrace when every rank has a compatible installation.
+                If disabled, DeepEP does not import or initialize DeepXTrace.
+            enable_deepxtrace_async: whether to run DeepXTrace collection in
+                asynchronous mode. If enabled, the periodic background
+                collector uses ``DEEPEP_DIAGNOSE_INTERVAL``. If disabled, all
+                EP ranks must call
+                :meth:`diagnose_normal_sync` at the same logical step, and
+                ``DEEPEP_DIAGNOSE_SYNC_STEP`` controls the collection cadence.
         """
         check_nvlink_connections(group)
+        if not isinstance(enable_deepxtrace_async, bool):
+            raise TypeError("`enable_deepxtrace_async` must be a bool")
+        self.enable_deepxtrace_async = enable_deepxtrace_async
 
         # Initialize the CPP runtime
         if group is not None:
@@ -113,6 +146,48 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
+
+        diagnose_module, deepxtrace_error = _load_deepxtrace(
+            enable_deepxtrace, group is not None)
+        local_deepxtrace_status = (
+            enable_deepxtrace,
+            diagnose_module is not None,
+            deepxtrace_error,
+            self.enable_deepxtrace_async,
+        )
+
+        deepxtrace_statuses = all_gather_object(local_deepxtrace_status)
+        all_deepxtrace_requested = all(
+            status[0] for status in deepxtrace_statuses)
+        all_deepxtrace_ready = all(
+            status[1] for status in deepxtrace_statuses)
+        if all_deepxtrace_requested:
+            configured_async_modes = {
+                status[3] for status in deepxtrace_statuses
+            }
+            if len(configured_async_modes) != 1:
+                raise RuntimeError(
+                    "All EP ranks must use the same "
+                    "`enable_deepxtrace_async`, but found "
+                    f"{sorted(configured_async_modes)!r}")
+        self.deepxtrace_enabled = (
+            all_deepxtrace_requested and all_deepxtrace_ready)
+        if (any(status[0] for status in deepxtrace_statuses) and
+                not self.deepxtrace_enabled and self.rank == 0):
+            unavailable = [
+                f"rank {rank}: {status[2]}"
+                for rank, status in enumerate(deepxtrace_statuses)
+                if not status[1]
+            ]
+            preview = "; ".join(unavailable[:8])
+            if len(unavailable) > 8:
+                preview += f"; ... and {len(unavailable) - 8} more ranks"
+            warnings.warn(
+                "DeepXTrace diagnosis is disabled for all ranks because "
+                f"the integration is not uniformly available: {preview}",
+                RuntimeWarning,
+                stacklevel=2)
+
         self.diagnose = None
         self._normal_diagnose_stats = {
             name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA
@@ -121,6 +196,7 @@ class Buffer:
         self._normal_notify_dispatch_full_kernel_timer_state = None
         self._normal_cached_notify_dispatch_full_kernel_timer_state = None
         self._normal_cached_notify_combine_full_kernel_timer_state = None
+
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -172,9 +248,26 @@ class Buffer:
             nvshmem_unique_ids = all_gather_object(root_unique_id)
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
+        # Start DeepXtrace
+        # LL diagnosis is intentionally disabled by DeepEP for now. Normal
+        # diagnostics instrument the normal dispatch/combine APIs and remain
+        # available when the runtime uses the low-latency NVSHMEM topology.
+        if self.deepxtrace_enabled:
+            self._initialize_normal_notify_timer_states()
+            self.diagnose = diagnose_module.Diagnose(
+                group=group,
+                enable_ll_diagnose=False,
+                enable_normal_diagnose=True,
+                enable_async=self.enable_deepxtrace_async,
+                snapshot_stream=self.get_comm_stream())
+            self._normal_diagnose_stats = self._get_normal_diagnose_stats()
+        # End DeepXtrace
+
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+        if self.diagnose is not None and self.enable_deepxtrace_async:
+            self.diagnose.start_async_diagnose()
 
     def _initialize_normal_notify_timer_states(self) -> None:
         """Create persistent per-launch notify timer scratch owned by DeepEP.
@@ -212,6 +305,24 @@ class Buffer:
                 "schema: "
                 f"{len(tensors)} != {len(_REQUIRED_NORMAL_STATS_SCHEMA)}")
         return dict(zip(_REQUIRED_NORMAL_STATS_SCHEMA, tensors))
+
+    def diagnose_normal_sync(self, diagnose_step: int = 0):
+        """Collect normal DeepXTrace statistics at a caller-owned step boundary.
+
+        Every rank in the EP group must call this method at the same logical
+        location and with the same cadence. ``DEEPEP_DIAGNOSE_SYNC_STEP`` is
+        used when ``diagnose_step`` is zero; a nonzero value overrides it.
+
+        Returns ``None`` when DeepXTrace is disabled. In async mode, collection
+        is owned by the background thread and this method raises.
+        """
+        if self.diagnose is None:
+            return None
+        if self.enable_deepxtrace_async:
+            raise RuntimeError(
+                "diagnose_normal_sync() requires "
+                "`enable_deepxtrace_async=False`")
+        return self.diagnose.diagnose_normal_sync(diagnose_step)
 
     @staticmethod
     def disable_ll_layered() -> bool:
@@ -763,6 +874,10 @@ class Buffer:
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if (dispatch_wait_recv_cost_stats is None and
+                self.diagnose is not None):
+            dispatch_wait_recv_cost_stats = \
+                self.diagnose.get_stats_ll_stats_tensor()[0]
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
@@ -830,6 +945,10 @@ class Buffer:
         """
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+        if (combine_wait_recv_cost_stats is None and
+                self.diagnose is not None):
+            combine_wait_recv_cost_stats = \
+                self.diagnose.get_stats_ll_stats_tensor()[1]
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range, overlap,
                                                                    packed_recv_count, comp_signal, block_m, threshold, num_sms,
                                                                    combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
