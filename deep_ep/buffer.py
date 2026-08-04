@@ -1,13 +1,42 @@
 import os
 import torch
 import torch.distributed as dist
-from typing import Callable, List, Tuple, Optional, Union
+from typing import Callable, Dict, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
 import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
+
+_REQUIRED_NORMAL_STATS_SCHEMA = (
+    "normal_notify_dispatch_full_kernel_duration_ns_stats",
+    "normal_notify_dispatch_full_kernel_count_stats",
+    "normal_cached_notify_dispatch_full_kernel_duration_ns_stats",
+    "normal_cached_notify_dispatch_full_kernel_count_stats",
+    "normal_cached_notify_combine_full_kernel_duration_ns_stats",
+    "normal_cached_notify_combine_full_kernel_count_stats",
+    "normal_dispatch_final_completion_cost_stats",
+    "normal_dispatch_final_completion_sample_count_stats",
+    "normal_dispatch_final_completion_token_count_stats",
+    "normal_dispatch_rdma_recv_completion_cost_stats",
+    "normal_dispatch_rdma_recv_completion_sample_count_stats",
+    "normal_dispatch_rdma_recv_completion_token_count_stats",
+    "normal_combine_logical_recv_completion_cost_stats",
+    "normal_combine_logical_recv_completion_sample_count_stats",
+    "normal_combine_logical_recv_completion_token_count_stats",
+)
+
+
+def _validate_deepxtrace_normal_stats_schema(diagnose_module) -> None:
+    actual_schema = getattr(
+        diagnose_module, "NORMAL_STATS_SCHEMA", None)
+    if tuple(actual_schema or ()) != _REQUIRED_NORMAL_STATS_SCHEMA:
+        raise RuntimeError(
+            "Incompatible deepxtrace normal-stats schema: DeepEP requires "
+            "deepxtrace>=0.2.0,<0.3.0 with fields ordered as "
+            "notify -> dispatch -> combine, but found schema "
+            f"{actual_schema!r}")
 
 
 class Buffer:
@@ -84,6 +113,10 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
+        self.diagnose = None
+        self._normal_diagnose_stats = {
+            name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA
+        }
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
@@ -138,6 +171,16 @@ class Buffer:
         # Make CPP runtime available
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
+
+    def _get_normal_diagnose_stats(
+            self) -> Dict[str, Optional[torch.Tensor]]:
+        tensors = self.diagnose.get_stats_normal_stats_tensor()
+        if len(tensors) != len(_REQUIRED_NORMAL_STATS_SCHEMA):
+            raise RuntimeError(
+                "DeepXTrace normal-stats tensor count does not match its "
+                "schema: "
+                f"{len(tensors)} != {len(_REQUIRED_NORMAL_STATS_SCHEMA)}")
+        return dict(zip(_REQUIRED_NORMAL_STATS_SCHEMA, tensors))
 
     @staticmethod
     def disable_ll_layered() -> bool:
