@@ -950,6 +950,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            const std::optional<torch::Tensor>& normal_dispatch_final_completion_cost_stats,
                            const std::optional<torch::Tensor>& normal_dispatch_final_completion_sample_count_stats,
                            const std::optional<torch::Tensor>& normal_dispatch_final_completion_token_count_stats,
+                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_cost_stats,
+                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_sample_count_stats,
+                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_token_count_stats,
                            const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats,
                            const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats,
                            const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_timer_state,
@@ -1013,6 +1016,20 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
     }
+    auto check_normal_dispatch_stat_pair = [=](const std::optional<torch::Tensor>& cost_stats,
+                                               const std::optional<torch::Tensor>& count_stats) {
+        if (cost_stats.has_value()) {
+            EP_HOST_ASSERT(cost_stats->scalar_type() == torch::kInt64);
+            EP_HOST_ASSERT(cost_stats->dim() == 1 and cost_stats->is_contiguous());
+            EP_HOST_ASSERT(cost_stats->size(0) == num_ranks);
+            EP_HOST_ASSERT(count_stats.has_value());
+            EP_HOST_ASSERT(count_stats->scalar_type() == torch::kInt64);
+            EP_HOST_ASSERT(count_stats->dim() == 1 and count_stats->is_contiguous());
+            EP_HOST_ASSERT(count_stats->size(0) == num_ranks);
+        } else {
+            EP_HOST_ASSERT(not count_stats.has_value());
+        }
+    };
     auto check_normal_dispatch_stat_tensor = [=](const std::optional<torch::Tensor>& stats) {
         if (stats.has_value()) {
             EP_HOST_ASSERT(stats->scalar_type() == torch::kInt64);
@@ -1026,6 +1043,9 @@ Buffer::internode_dispatch(const torch::Tensor& x,
     check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_cost_stats);
     check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_sample_count_stats);
     check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_token_count_stats);
+    check_normal_dispatch_stat_pair(normal_dispatch_rdma_recv_completion_cost_stats,
+                                    normal_dispatch_rdma_recv_completion_sample_count_stats);
+    check_normal_dispatch_stat_tensor(normal_dispatch_rdma_recv_completion_token_count_stats);
     auto check_normal_notify_stats = [](const std::optional<torch::Tensor>& duration_ns_stats,
                                         const std::optional<torch::Tensor>& count_stats,
                                         const std::optional<torch::Tensor>& timer_state) {
@@ -1303,6 +1323,15 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                             : nullptr,
                         normal_dispatch_final_completion_token_count_stats.has_value()
                             ? normal_dispatch_final_completion_token_count_stats->data_ptr<int64_t>()
+                            : nullptr,
+                        normal_dispatch_rdma_recv_completion_cost_stats.has_value()
+                            ? normal_dispatch_rdma_recv_completion_cost_stats->data_ptr<int64_t>()
+                            : nullptr,
+                        normal_dispatch_rdma_recv_completion_sample_count_stats.has_value()
+                            ? normal_dispatch_rdma_recv_completion_sample_count_stats->data_ptr<int64_t>()
+                            : nullptr,
+                        normal_dispatch_rdma_recv_completion_token_count_stats.has_value()
+                            ? normal_dispatch_rdma_recv_completion_token_count_stats->data_ptr<int64_t>()
                             : nullptr,
                         rank,
                         num_ranks,

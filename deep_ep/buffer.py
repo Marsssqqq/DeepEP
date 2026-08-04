@@ -579,6 +579,12 @@ class Buffer:
             "normal_dispatch_final_completion_sample_count_stats"]
         normal_dispatch_final_completion_token_count_stats = normal_stats[
             "normal_dispatch_final_completion_token_count_stats"]
+        normal_dispatch_rdma_recv_completion_cost_stats = normal_stats[
+            "normal_dispatch_rdma_recv_completion_cost_stats"]
+        normal_dispatch_rdma_recv_completion_sample_count_stats = normal_stats[
+            "normal_dispatch_rdma_recv_completion_sample_count_stats"]
+        normal_dispatch_rdma_recv_completion_token_count_stats = normal_stats[
+            "normal_dispatch_rdma_recv_completion_token_count_stats"]
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -594,6 +600,9 @@ class Buffer:
                 normal_dispatch_final_completion_cost_stats,
                 normal_dispatch_final_completion_sample_count_stats,
                 normal_dispatch_final_completion_token_count_stats,
+                normal_dispatch_rdma_recv_completion_cost_stats,
+                normal_dispatch_rdma_recv_completion_sample_count_stats,
+                normal_dispatch_rdma_recv_completion_token_count_stats,
                 normal_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_notify_dispatch_full_kernel_count_stats,
                 normal_notify_dispatch_full_kernel_timer_state,
@@ -615,6 +624,9 @@ class Buffer:
                 normal_dispatch_final_completion_cost_stats,
                 normal_dispatch_final_completion_sample_count_stats,
                 normal_dispatch_final_completion_token_count_stats,
+                normal_dispatch_rdma_recv_completion_cost_stats,
+                normal_dispatch_rdma_recv_completion_sample_count_stats,
+                normal_dispatch_rdma_recv_completion_token_count_stats,
                 normal_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_notify_dispatch_full_kernel_count_stats,
                 normal_notify_dispatch_full_kernel_timer_state,

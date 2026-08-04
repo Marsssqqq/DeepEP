@@ -533,6 +533,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
              int64_t* normal_dispatch_final_completion_cost_stats,
              int64_t* normal_dispatch_final_completion_sample_count_stats,
              int64_t* normal_dispatch_final_completion_token_count_stats,
+             int64_t* normal_dispatch_rdma_recv_completion_cost_stats,
+             int64_t* normal_dispatch_rdma_recv_completion_sample_count_stats,
+             int64_t* normal_dispatch_rdma_recv_completion_token_count_stats,
              int rank,
              int num_ranks) {
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
@@ -904,6 +907,9 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
 
         // Wait counters to arrive
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
+        int rdma_recv_completion_expected_count = 0;
+        uint64_t rdma_recv_completion_start_time = 0;
+        bool rdma_recv_completion_recorded = false;
         EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
         auto start_time = clock64();
         if (lane_id < kNumRDMARanks) {
@@ -927,6 +933,8 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                         recv_rdma_channel_prefix_matrix[lane_id * num_channels + channel_id] = src_rdma_channel_prefix_1;
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
+                    rdma_recv_completion_expected_count = num_tokens_to_recv_from_rdma;
+                    rdma_recv_completion_start_time = clock64();
                     break;
                 }
 
@@ -949,6 +957,31 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
         }
         __syncwarp();
+        if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+              normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
+             normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
+            dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
+            not rdma_recv_completion_recorded) {
+            const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+            if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
+                const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
+                const auto stats_idx = src_gateway_rank;
+                if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+                    normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
+                              clock64() - rdma_recv_completion_start_time);
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
+                        1);
+                }
+                if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
+                        rdma_recv_completion_expected_count);
+                }
+                rdma_recv_completion_recorded = true;
+            }
+        }
 
         // Shift cached head
         send_nvl_head += src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
@@ -962,6 +995,32 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
+            if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+                  normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
+                 normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
+                dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
+                not rdma_recv_completion_recorded) {
+                const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+                if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
+                    const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
+                    const auto stats_idx = src_gateway_rank;
+                    if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+                        normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
+                        atomicAdd(
+                            reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
+                            clock64() - rdma_recv_completion_start_time);
+                        atomicAdd(reinterpret_cast<unsigned long long*>(
+                                      normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
+                                  1);
+                    }
+                    if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
+                        atomicAdd(reinterpret_cast<unsigned long long*>(
+                                      normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
+                                  rdma_recv_completion_expected_count);
+                    }
+                    rdma_recv_completion_recorded = true;
+                }
+            }
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
             while (true) {
@@ -1062,6 +1121,31 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             __syncwarp();
             if (elect_one_sync())
                 st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+        }
+        if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+              normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
+             normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
+            dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
+            not rdma_recv_completion_recorded) {
+            const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+            if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
+                const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
+                const auto stats_idx = src_gateway_rank;
+                if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
+                    normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
+                    atomicAdd(reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
+                              clock64() - rdma_recv_completion_start_time);
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
+                        1);
+                }
+                if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
+                        rdma_recv_completion_expected_count);
+                }
+                rdma_recv_completion_recorded = true;
+            }
         }
 
         // Retired
@@ -1321,6 +1405,9 @@ void dispatch(void* recv_x,
               int64_t* normal_dispatch_final_completion_cost_stats,
               int64_t* normal_dispatch_final_completion_sample_count_stats,
               int64_t* normal_dispatch_final_completion_token_count_stats,
+              int64_t* normal_dispatch_rdma_recv_completion_cost_stats,
+              int64_t* normal_dispatch_rdma_recv_completion_sample_count_stats,
+              int64_t* normal_dispatch_rdma_recv_completion_token_count_stats,
               int rank,
               int num_ranks,
               bool is_cached_dispatch,
@@ -1382,6 +1469,9 @@ void dispatch(void* recv_x,
                       normal_dispatch_final_completion_cost_stats,                                                             \
                       normal_dispatch_final_completion_sample_count_stats,                                                     \
                       normal_dispatch_final_completion_token_count_stats,                                                      \
+                      normal_dispatch_rdma_recv_completion_cost_stats,                                                   \
+                      normal_dispatch_rdma_recv_completion_sample_count_stats,                                           \
+                      normal_dispatch_rdma_recv_completion_token_count_stats,                                            \
                       rank,                                                                                                    \
                       num_ranks);                                                                                              \
     }                                                                                                                          \
