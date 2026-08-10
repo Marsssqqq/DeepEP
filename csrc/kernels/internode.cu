@@ -31,9 +31,7 @@ __device__ __forceinline__ void notify_full_kernel_timer_begin(int64_t* timer_st
     __syncthreads();
 }
 
-__device__ __forceinline__ void notify_full_kernel_timer_end(int64_t* timer_state,
-                                                             int64_t* duration_ns_stats,
-                                                             int64_t* count_stats) {
+__device__ __forceinline__ void notify_full_kernel_timer_end(int64_t* timer_state, int64_t* duration_ns_stats, int64_t* count_stats) {
     if (timer_state == nullptr)
         return;
 
@@ -50,16 +48,15 @@ __device__ __forceinline__ void notify_full_kernel_timer_end(int64_t* timer_stat
     }
 }
 
-__device__ __forceinline__ void try_record_dispatch_rdma_recv_completion(
-    int64_t* cost_stats,
-    int64_t* sample_count_stats,
-    int64_t* token_count_stats,
-    const uint64_t* rdma_channel_tail,
-    int src_rdma_rank,
-    int gateway_nvl_rank,
-    int expected_count,
-    uint64_t start_time,
-    bool& recorded) {
+__device__ __forceinline__ void try_record_dispatch_rdma_recv_completion(int64_t* cost_stats,
+                                                                         int64_t* sample_count_stats,
+                                                                         int64_t* token_count_stats,
+                                                                         const uint64_t* rdma_channel_tail,
+                                                                         int src_rdma_rank,
+                                                                         int gateway_nvl_rank,
+                                                                         int expected_count,
+                                                                         uint64_t start_time,
+                                                                         bool& recorded) {
     if (cost_stats == nullptr or expected_count <= 0 or recorded)
         return;
 
@@ -1256,8 +1253,7 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
                 int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
                 int completion_stats_idx = -1;
-                if (enable_normal_dispatch_final_completion_stats and lane_id == meta.src_rdma_rank and
-                    completion_expected_count > 0) {
+                if (enable_normal_dispatch_final_completion_stats and lane_id == meta.src_rdma_rank and completion_expected_count > 0) {
                     completion_recv_count += 1;
                     if (completion_recv_count == completion_expected_count) {
                         const auto src_global_rank = lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
@@ -1406,8 +1402,7 @@ void dispatch(void* recv_x,
     const bool enable_normal_dispatch_final_completion_stats = normal_dispatch_final_completion_cost_stats != nullptr;
     EP_HOST_ASSERT((normal_dispatch_final_completion_sample_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
     EP_HOST_ASSERT((normal_dispatch_final_completion_token_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
-    const bool enable_normal_dispatch_rdma_recv_completion_stats =
-        normal_dispatch_rdma_recv_completion_cost_stats != nullptr;
+    const bool enable_normal_dispatch_rdma_recv_completion_stats = normal_dispatch_rdma_recv_completion_cost_stats != nullptr;
     EP_HOST_ASSERT((normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) ==
                    enable_normal_dispatch_rdma_recv_completion_stats);
     EP_HOST_ASSERT((normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) ==
@@ -1458,9 +1453,9 @@ void dispatch(void* recv_x,
                       normal_dispatch_final_completion_cost_stats,                                                             \
                       normal_dispatch_final_completion_sample_count_stats,                                                     \
                       normal_dispatch_final_completion_token_count_stats,                                                      \
-                      normal_dispatch_rdma_recv_completion_cost_stats,                                                   \
-                      normal_dispatch_rdma_recv_completion_sample_count_stats,                                           \
-                      normal_dispatch_rdma_recv_completion_token_count_stats,                                            \
+                      normal_dispatch_rdma_recv_completion_cost_stats,                                                         \
+                      normal_dispatch_rdma_recv_completion_sample_count_stats,                                                 \
+                      normal_dispatch_rdma_recv_completion_token_count_stats,                                                  \
                       rank,                                                                                                    \
                       num_ranks);                                                                                              \
     }                                                                                                                          \
@@ -2408,8 +2403,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
         } else {
             // Coordinator
             const bool enable_logical_completion = normal_combine_logical_recv_completion_cost_stats != nullptr and
-                                                   normal_combine_logical_recv_completion_sample_count_stats != nullptr and
-                                                   normal_combine_logical_recv_completion_token_count_stats != nullptr;
+                normal_combine_logical_recv_completion_sample_count_stats != nullptr and
+                normal_combine_logical_recv_completion_token_count_stats != nullptr;
             int logical_expected_count[NUM_MAX_NVL_PEERS] = {0};
             int logical_last_expected_head[NUM_MAX_NVL_PEERS];
             uint32_t logical_expected_mask = 0, logical_recorded_mask = 0;
@@ -2427,8 +2422,8 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                 get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
                 for (int token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
                     // Torch allocations are sufficiently aligned, and both the row stride and lane offset are multiples of 8 bytes.
-                    const auto src_rank_mask = __ldg(reinterpret_cast<const uint64_t*>(
-                        is_combined_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
+                    const auto src_rank_mask = __ldg(
+                        reinterpret_cast<const uint64_t*>(is_combined_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                     if (src_rank_mask == 0)
                         continue;
                     const auto expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + lane_id);
@@ -2440,8 +2435,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                         const auto src_bit = 1u << src_nvl_rank;
                         if (((src_rank_mask >> (src_nvl_rank * 8)) & 0xffu) != 0) {
                             logical_expected_count[src_nvl_rank] += 1;
-                            logical_last_expected_head[src_nvl_rank] =
-                                max(logical_last_expected_head[src_nvl_rank], expected_head);
+                            logical_last_expected_head[src_nvl_rank] = max(logical_last_expected_head[src_nvl_rank], expected_head);
                             logical_expected_mask |= src_bit;
                         }
                     }
@@ -2471,14 +2465,14 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
                         if ((logical_expected_mask & src_bit) != 0 and (logical_recorded_mask & src_bit) == 0 and
                             observed_tail > logical_last_expected_head[src_nvl_rank]) {
                             const auto src_global_rank = lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank;
-                            atomicAdd(reinterpret_cast<unsigned long long*>(
-                                          normal_combine_logical_recv_completion_cost_stats + src_global_rank),
-                                      completion_end_time - logical_completion_start_time);
-                            atomicAdd(reinterpret_cast<unsigned long long*>(
-                                          normal_combine_logical_recv_completion_sample_count_stats + src_global_rank),
+                            atomicAdd(
+                                reinterpret_cast<unsigned long long*>(normal_combine_logical_recv_completion_cost_stats + src_global_rank),
+                                completion_end_time - logical_completion_start_time);
+                            atomicAdd(reinterpret_cast<unsigned long long*>(normal_combine_logical_recv_completion_sample_count_stats +
+                                                                            src_global_rank),
                                       1);
-                            atomicAdd(reinterpret_cast<unsigned long long*>(
-                                          normal_combine_logical_recv_completion_token_count_stats + src_global_rank),
+                            atomicAdd(reinterpret_cast<unsigned long long*>(normal_combine_logical_recv_completion_token_count_stats +
+                                                                            src_global_rank),
                                       static_cast<unsigned long long>(logical_expected_count[src_nvl_rank]));
                             logical_recorded_mask |= src_bit;
                         }
