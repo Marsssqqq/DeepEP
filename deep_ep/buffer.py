@@ -82,7 +82,7 @@ class Buffer:
                  group: Optional[dist.ProcessGroup],
                  num_nvl_bytes: int = 0,
                  num_rdma_bytes: int = 0,
-                 low_latency_mode: bool = True,
+                 low_latency_mode: bool = False,
                  num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
@@ -90,7 +90,7 @@ class Buffer:
                  explicitly_destroy: bool = False,
                  enable_shrink: bool = False,
                  comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
-                 enable_deepxtrace: bool = True,
+                 enable_deepxtrace: bool = False,
                  enable_deepxtrace_async: bool = True) -> None:
         """
         Initialize the communication buffer.
@@ -113,8 +113,8 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
-            enable_deepxtrace: automatically enable DeepXTrace when every rank has a compatible installation.
-                If disabled, DeepEP does not import or initialize DeepXTrace.
+            enable_deepxtrace: whether to enable the optional DeepXTrace integration. DeepEP does not import or initialize
+                DeepXTrace unless this option is explicitly enabled on every EP rank.
             enable_deepxtrace_async: whether to run DeepXTrace collection in
                 asynchronous mode. If enabled, the periodic background
                 collector uses ``DEEPEP_DIAGNOSE_INTERVAL``. If disabled, all
