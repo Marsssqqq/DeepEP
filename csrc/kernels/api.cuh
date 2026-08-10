@@ -210,6 +210,8 @@ void dispatch(void* recv_x,
               void** buffer_ptrs,
               int num_max_nvl_chunked_send_tokens,
               int num_max_nvl_chunked_recv_tokens,
+              // Completion cost tensors accumulate clock64() SM cycles;
+              // Notify duration tensors accumulate %globaltimer nanoseconds.
               int64_t* normal_dispatch_final_completion_cost_stats,
               int64_t* normal_dispatch_final_completion_sample_count_stats,
               int64_t* normal_dispatch_final_completion_token_count_stats,
@@ -273,6 +275,8 @@ void combine(cudaDataType_t type,
              void** buffer_ptrs,
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens,
+             // Completion cost tensors accumulate clock64() SM cycles;
+             // Notify duration tensors accumulate %globaltimer nanoseconds.
              int64_t* normal_combine_logical_recv_completion_cost_stats,
              int64_t* normal_combine_logical_recv_completion_sample_count_stats,
              int64_t* normal_combine_logical_recv_completion_token_count_stats,

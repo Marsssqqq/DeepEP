@@ -50,6 +50,35 @@ __device__ __forceinline__ void notify_full_kernel_timer_end(int64_t* timer_stat
     }
 }
 
+__device__ __forceinline__ void try_record_dispatch_rdma_recv_completion(
+    int64_t* cost_stats,
+    int64_t* sample_count_stats,
+    int64_t* token_count_stats,
+    const uint64_t* rdma_channel_tail,
+    int src_rdma_rank,
+    int gateway_nvl_rank,
+    int expected_count,
+    uint64_t start_time,
+    bool& recorded) {
+    if (cost_stats == nullptr or expected_count <= 0 or recorded)
+        return;
+
+    const auto observed_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail));
+    if (observed_tail < expected_count)
+        return;
+
+    // An RDMA lane aggregates one source node. DeepEP's symmetric PE mapping
+    // attributes that node-level completion to its gateway PE, whose local NVL
+    // rank matches this receiver. This is a gateway proxy, not per-source-GPU
+    // completion timing.
+    const auto src_gateway_proxy_rank = src_rdma_rank * NUM_MAX_NVL_PEERS + gateway_nvl_rank;
+    atomicAdd(reinterpret_cast<unsigned long long*>(cost_stats + src_gateway_proxy_rank), clock64() - start_time);
+    atomicAdd(reinterpret_cast<unsigned long long*>(sample_count_stats + src_gateway_proxy_rank), 1ull);
+    atomicAdd(reinterpret_cast<unsigned long long*>(token_count_stats + src_gateway_proxy_rank),
+              static_cast<unsigned long long>(expected_count));
+    recorded = true;
+}
+
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
@@ -957,31 +986,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             }
         }
         __syncwarp();
-        if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-              normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
-             normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
-            dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
-            not rdma_recv_completion_recorded) {
-            const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-            if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
-                const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
-                const auto stats_idx = src_gateway_rank;
-                if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-                    normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
-                    atomicAdd(reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
-                              clock64() - rdma_recv_completion_start_time);
-                    atomicAdd(
-                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
-                        1);
-                }
-                if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
-                    atomicAdd(
-                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
-                        rdma_recv_completion_expected_count);
-                }
-                rdma_recv_completion_recorded = true;
-            }
-        }
+        if (dst_nvl_rank == 0 and lane_id < kNumRDMARanks)
+            try_record_dispatch_rdma_recv_completion(normal_dispatch_rdma_recv_completion_cost_stats,
+                                                     normal_dispatch_rdma_recv_completion_sample_count_stats,
+                                                     normal_dispatch_rdma_recv_completion_token_count_stats,
+                                                     rdma_channel_tail.buffer(lane_id),
+                                                     lane_id,
+                                                     nvl_rank,
+                                                     rdma_recv_completion_expected_count,
+                                                     rdma_recv_completion_start_time,
+                                                     rdma_recv_completion_recorded);
 
         // Shift cached head
         send_nvl_head += src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
@@ -995,32 +1009,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
-            if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-                  normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
-                 normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
-                dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
-                not rdma_recv_completion_recorded) {
-                const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-                if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
-                    const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
-                    const auto stats_idx = src_gateway_rank;
-                    if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-                        normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
-                        atomicAdd(
-                            reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
-                            clock64() - rdma_recv_completion_start_time);
-                        atomicAdd(reinterpret_cast<unsigned long long*>(
-                                      normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
-                                  1);
-                    }
-                    if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
-                        atomicAdd(reinterpret_cast<unsigned long long*>(
-                                      normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
-                                  rdma_recv_completion_expected_count);
-                    }
-                    rdma_recv_completion_recorded = true;
-                }
-            }
+            if (dst_nvl_rank == 0 and lane_id < kNumRDMARanks)
+                try_record_dispatch_rdma_recv_completion(normal_dispatch_rdma_recv_completion_cost_stats,
+                                                         normal_dispatch_rdma_recv_completion_sample_count_stats,
+                                                         normal_dispatch_rdma_recv_completion_token_count_stats,
+                                                         rdma_channel_tail.buffer(lane_id),
+                                                         lane_id,
+                                                         nvl_rank,
+                                                         rdma_recv_completion_expected_count,
+                                                         rdma_recv_completion_start_time,
+                                                         rdma_recv_completion_recorded);
             // Check destination queue emptiness, or wait a buffer to be released
             start_time = clock64();
             while (true) {
@@ -1122,31 +1120,16 @@ __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NV
             if (elect_one_sync())
                 st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
-        if (((normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-              normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) or
-             normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) and
-            dst_nvl_rank == 0 and lane_id < kNumRDMARanks and rdma_recv_completion_expected_count > 0 and
-            not rdma_recv_completion_recorded) {
-            const auto observed_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
-            if (observed_rdma_channel_tail >= rdma_recv_completion_expected_count) {
-                const auto src_gateway_rank = lane_id * NUM_MAX_NVL_PEERS + nvl_rank;
-                const auto stats_idx = src_gateway_rank;
-                if (normal_dispatch_rdma_recv_completion_cost_stats != nullptr and
-                    normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) {
-                    atomicAdd(reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_cost_stats + stats_idx),
-                              clock64() - rdma_recv_completion_start_time);
-                    atomicAdd(
-                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_sample_count_stats + stats_idx),
-                        1);
-                }
-                if (normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) {
-                    atomicAdd(
-                        reinterpret_cast<unsigned long long*>(normal_dispatch_rdma_recv_completion_token_count_stats + stats_idx),
-                        rdma_recv_completion_expected_count);
-                }
-                rdma_recv_completion_recorded = true;
-            }
-        }
+        if (dst_nvl_rank == 0 and lane_id < kNumRDMARanks)
+            try_record_dispatch_rdma_recv_completion(normal_dispatch_rdma_recv_completion_cost_stats,
+                                                     normal_dispatch_rdma_recv_completion_sample_count_stats,
+                                                     normal_dispatch_rdma_recv_completion_token_count_stats,
+                                                     rdma_channel_tail.buffer(lane_id),
+                                                     lane_id,
+                                                     nvl_rank,
+                                                     rdma_recv_completion_expected_count,
+                                                     rdma_recv_completion_start_time,
+                                                     rdma_recv_completion_recorded);
 
         // Retired
         __syncwarp();
@@ -1423,6 +1406,12 @@ void dispatch(void* recv_x,
     const bool enable_normal_dispatch_final_completion_stats = normal_dispatch_final_completion_cost_stats != nullptr;
     EP_HOST_ASSERT((normal_dispatch_final_completion_sample_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
     EP_HOST_ASSERT((normal_dispatch_final_completion_token_count_stats != nullptr) == enable_normal_dispatch_final_completion_stats);
+    const bool enable_normal_dispatch_rdma_recv_completion_stats =
+        normal_dispatch_rdma_recv_completion_cost_stats != nullptr;
+    EP_HOST_ASSERT((normal_dispatch_rdma_recv_completion_sample_count_stats != nullptr) ==
+                   enable_normal_dispatch_rdma_recv_completion_stats);
+    EP_HOST_ASSERT((normal_dispatch_rdma_recv_completion_token_count_stats != nullptr) ==
+                   enable_normal_dispatch_rdma_recv_completion_stats);
 
 #define DISPATCH_LAUNCH_CASE(num_rdma_ranks)                                                                                   \
     {                                                                                                                          \
@@ -2432,15 +2421,20 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * 32, 1) combine(int4* co
             // Recover logical global-rank dependencies from the dispatch routing bitmap.
             // One coordinator lane owns one source RDMA rank and its eight NVL ranks.
             if (not is_forwarder_sm and enable_logical_completion and lane_id < kNumRDMARanks) {
+                EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t),
+                                 "The combine routing bitmap must be readable in aligned 64-bit groups");
                 int token_start_idx, token_end_idx;
                 get_channel_task_range(num_combined_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
                 for (int token_idx = token_start_idx; token_idx < token_end_idx; ++token_idx) {
+                    // Torch allocations are sufficiently aligned, and both the row stride and lane offset are multiples of 8 bytes.
                     const auto src_rank_mask = __ldg(reinterpret_cast<const uint64_t*>(
                         is_combined_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                     if (src_rank_mask == 0)
                         continue;
                     const auto expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + lane_id);
-                    EP_DEVICE_ASSERT(expected_head >= 0);
+                    // Probe reconstruction must remain fail-open if queue metadata is incomplete.
+                    if (expected_head < 0)
+                        continue;
                     #pragma unroll
                     for (int src_nvl_rank = 0; src_nvl_rank < NUM_MAX_NVL_PEERS; ++src_nvl_rank) {
                         const auto src_bit = 1u << src_nvl_rank;

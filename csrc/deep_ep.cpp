@@ -1016,20 +1016,6 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
     }
-    auto check_normal_dispatch_stat_pair = [=](const std::optional<torch::Tensor>& cost_stats,
-                                               const std::optional<torch::Tensor>& count_stats) {
-        if (cost_stats.has_value()) {
-            EP_HOST_ASSERT(cost_stats->scalar_type() == torch::kInt64);
-            EP_HOST_ASSERT(cost_stats->dim() == 1 and cost_stats->is_contiguous());
-            EP_HOST_ASSERT(cost_stats->size(0) == num_ranks);
-            EP_HOST_ASSERT(count_stats.has_value());
-            EP_HOST_ASSERT(count_stats->scalar_type() == torch::kInt64);
-            EP_HOST_ASSERT(count_stats->dim() == 1 and count_stats->is_contiguous());
-            EP_HOST_ASSERT(count_stats->size(0) == num_ranks);
-        } else {
-            EP_HOST_ASSERT(not count_stats.has_value());
-        }
-    };
     auto check_normal_dispatch_stat_tensor = [=](const std::optional<torch::Tensor>& stats) {
         if (stats.has_value()) {
             EP_HOST_ASSERT(stats->scalar_type() == torch::kInt64);
@@ -1037,15 +1023,22 @@ Buffer::internode_dispatch(const torch::Tensor& x,
             EP_HOST_ASSERT(stats->size(0) == num_ranks);
         }
     };
-    const bool enable_normal_dispatch_final_completion_stats = normal_dispatch_final_completion_cost_stats.has_value();
-    EP_HOST_ASSERT(normal_dispatch_final_completion_sample_count_stats.has_value() == enable_normal_dispatch_final_completion_stats);
-    EP_HOST_ASSERT(normal_dispatch_final_completion_token_count_stats.has_value() == enable_normal_dispatch_final_completion_stats);
-    check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_cost_stats);
-    check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_sample_count_stats);
-    check_normal_dispatch_stat_tensor(normal_dispatch_final_completion_token_count_stats);
-    check_normal_dispatch_stat_pair(normal_dispatch_rdma_recv_completion_cost_stats,
-                                    normal_dispatch_rdma_recv_completion_sample_count_stats);
-    check_normal_dispatch_stat_tensor(normal_dispatch_rdma_recv_completion_token_count_stats);
+    auto check_normal_dispatch_stat_triplet = [&](const std::optional<torch::Tensor>& cost_stats,
+                                                  const std::optional<torch::Tensor>& sample_count_stats,
+                                                  const std::optional<torch::Tensor>& token_count_stats) {
+        const bool enabled = cost_stats.has_value();
+        EP_HOST_ASSERT(sample_count_stats.has_value() == enabled);
+        EP_HOST_ASSERT(token_count_stats.has_value() == enabled);
+        check_normal_dispatch_stat_tensor(cost_stats);
+        check_normal_dispatch_stat_tensor(sample_count_stats);
+        check_normal_dispatch_stat_tensor(token_count_stats);
+    };
+    check_normal_dispatch_stat_triplet(normal_dispatch_final_completion_cost_stats,
+                                       normal_dispatch_final_completion_sample_count_stats,
+                                       normal_dispatch_final_completion_token_count_stats);
+    check_normal_dispatch_stat_triplet(normal_dispatch_rdma_recv_completion_cost_stats,
+                                       normal_dispatch_rdma_recv_completion_sample_count_stats,
+                                       normal_dispatch_rdma_recv_completion_token_count_stats);
     auto check_normal_notify_stats = [](const std::optional<torch::Tensor>& duration_ns_stats,
                                         const std::optional<torch::Tensor>& count_stats,
                                         const std::optional<torch::Tensor>& timer_state) {
@@ -2054,8 +2047,63 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_dispatch_layout", &deep_ep::Buffer::get_dispatch_layout)
         .def("intranode_dispatch", &deep_ep::Buffer::intranode_dispatch)
         .def("intranode_combine", &deep_ep::Buffer::intranode_combine)
-        .def("internode_dispatch", &deep_ep::Buffer::internode_dispatch)
-        .def("internode_combine", &deep_ep::Buffer::internode_combine)
+        .def("internode_dispatch",
+             &deep_ep::Buffer::internode_dispatch,
+             py::arg("x"),
+             py::arg("x_scales"),
+             py::arg("topk_idx"),
+             py::arg("topk_weights"),
+             py::arg("num_tokens_per_rank"),
+             py::arg("num_tokens_per_rdma_rank"),
+             py::arg("is_token_in_rank"),
+             py::arg("num_tokens_per_expert"),
+             py::arg("cached_num_recv_tokens"),
+             py::arg("cached_num_rdma_recv_tokens"),
+             py::arg("cached_rdma_channel_prefix_matrix"),
+             py::arg("cached_recv_rdma_rank_prefix_sum"),
+             py::arg("cached_gbl_channel_prefix_matrix"),
+             py::arg("cached_recv_gbl_rank_prefix_sum"),
+             py::arg("expert_alignment"),
+             py::arg("num_worst_tokens"),
+             py::arg("config"),
+             py::arg("previous_event"),
+             py::arg("async"),
+             py::arg("allocate_on_comm_stream"),
+             py::arg("normal_dispatch_final_completion_cost_stats") = py::none(),
+             py::arg("normal_dispatch_final_completion_sample_count_stats") = py::none(),
+             py::arg("normal_dispatch_final_completion_token_count_stats") = py::none(),
+             py::arg("normal_dispatch_rdma_recv_completion_cost_stats") = py::none(),
+             py::arg("normal_dispatch_rdma_recv_completion_sample_count_stats") = py::none(),
+             py::arg("normal_dispatch_rdma_recv_completion_token_count_stats") = py::none(),
+             py::arg("normal_notify_dispatch_full_kernel_duration_ns_stats") = py::none(),
+             py::arg("normal_notify_dispatch_full_kernel_count_stats") = py::none(),
+             py::arg("normal_notify_dispatch_full_kernel_timer_state") = py::none(),
+             py::arg("normal_cached_notify_dispatch_full_kernel_duration_ns_stats") = py::none(),
+             py::arg("normal_cached_notify_dispatch_full_kernel_count_stats") = py::none(),
+             py::arg("normal_cached_notify_dispatch_full_kernel_timer_state") = py::none())
+        .def("internode_combine",
+             &deep_ep::Buffer::internode_combine,
+             py::arg("x"),
+             py::arg("topk_weights"),
+             py::arg("bias_0"),
+             py::arg("bias_1"),
+             py::arg("src_meta"),
+             py::arg("is_combined_token_in_rank"),
+             py::arg("rdma_channel_prefix_matrix"),
+             py::arg("rdma_rank_prefix_sum"),
+             py::arg("gbl_channel_prefix_matrix"),
+             py::arg("combined_rdma_head"),
+             py::arg("combined_nvl_head"),
+             py::arg("config"),
+             py::arg("previous_event"),
+             py::arg("async"),
+             py::arg("allocate_on_comm_stream"),
+             py::arg("normal_cached_notify_combine_full_kernel_duration_ns_stats") = py::none(),
+             py::arg("normal_cached_notify_combine_full_kernel_count_stats") = py::none(),
+             py::arg("normal_cached_notify_combine_full_kernel_timer_state") = py::none(),
+             py::arg("normal_combine_logical_recv_completion_cost_stats") = py::none(),
+             py::arg("normal_combine_logical_recv_completion_sample_count_stats") = py::none(),
+             py::arg("normal_combine_logical_recv_completion_token_count_stats") = py::none())
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
