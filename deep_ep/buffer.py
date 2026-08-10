@@ -1,6 +1,7 @@
 import importlib
 import os
 import warnings
+import weakref
 import torch
 import torch.distributed as dist
 from typing import Callable, Dict, List, Tuple, Optional, Union
@@ -54,8 +55,8 @@ def _load_deepxtrace(enable_deepxtrace: bool, has_torch_group: bool):
     try:
         diagnose_module = importlib.import_module("deepxtrace.diagnose")
         _validate_deepxtrace_normal_stats_schema(diagnose_module)
-    except (ImportError, RuntimeError) as exc:
-        return None, str(exc)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
     return diagnose_module, None
 
 
@@ -189,6 +190,7 @@ class Buffer:
                 stacklevel=2)
 
         self.diagnose = None
+        self._deepxtrace_finalizer = None
         self._normal_diagnose_stats = {
             name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA
         }
@@ -248,7 +250,11 @@ class Buffer:
             nvshmem_unique_ids = all_gather_object(root_unique_id)
             root_unique_id = nvshmem_unique_ids[0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)]
 
-        # Start DeepXtrace
+        # Make CPP runtime available
+        self.runtime.sync(device_ids, ipc_handles, root_unique_id)
+        assert self.runtime.is_available()
+
+        # Start DeepXTrace
         # LL diagnosis is intentionally disabled by DeepEP for now. Normal
         # diagnostics instrument the normal dispatch/combine APIs and remain
         # available when the runtime uses the low-latency NVSHMEM topology.
@@ -261,13 +267,11 @@ class Buffer:
                 enable_async=self.enable_deepxtrace_async,
                 snapshot_stream=self.get_comm_stream())
             self._normal_diagnose_stats = self._get_normal_diagnose_stats()
-        # End DeepXtrace
-
-        # Make CPP runtime available
-        self.runtime.sync(device_ids, ipc_handles, root_unique_id)
-        assert self.runtime.is_available()
-        if self.diagnose is not None and self.enable_deepxtrace_async:
-            self.diagnose.start_async_diagnose()
+            if self.enable_deepxtrace_async:
+                self.diagnose.start_async_diagnose()
+                self._deepxtrace_finalizer = weakref.finalize(
+                    self, self.diagnose.stop_async_diagnose)
+        # End DeepXTrace
 
     def _initialize_normal_notify_timer_states(self) -> None:
         """Create persistent per-launch notify timer scratch owned by DeepEP.
@@ -310,8 +314,10 @@ class Buffer:
         """Collect normal DeepXTrace statistics at a caller-owned step boundary.
 
         Every rank in the EP group must call this method at the same logical
-        location and with the same cadence. ``DEEPEP_DIAGNOSE_SYNC_STEP`` is
-        used when ``diagnose_step`` is zero; a nonzero value overrides it.
+        location and with the same cadence. Mismatched calls can deadlock the
+        diagnostic collectives or assign samples to different windows.
+        ``DEEPEP_DIAGNOSE_SYNC_STEP`` is used when ``diagnose_step`` is zero;
+        a nonzero value overrides it.
 
         Returns ``None`` when DeepXTrace is disabled. In async mode, collection
         is owned by the background thread and this method raises.
@@ -339,8 +345,27 @@ class Buffer:
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
 
+        self._stop_deepxtrace()
         self.runtime.destroy()
         self.runtime = None
+
+    def _stop_deepxtrace(self) -> None:
+        """Stop the optional background collector before runtime teardown."""
+        finalizer = getattr(self, "_deepxtrace_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+        elif (getattr(self, "diagnose", None) is not None and
+              getattr(self, "enable_deepxtrace_async", False)):
+            self.diagnose.stop_async_diagnose()
+        self._deepxtrace_finalizer = None
+        self.diagnose = None
+        self._normal_diagnose_stats = {
+            name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA
+        }
+        self._normal_notify_full_kernel_timer_states = None
+        self._normal_notify_dispatch_full_kernel_timer_state = None
+        self._normal_cached_notify_dispatch_full_kernel_timer_state = None
+        self._normal_cached_notify_combine_full_kernel_timer_state = None
 
     @staticmethod
     def is_sm90_compiled():
