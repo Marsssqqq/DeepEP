@@ -115,15 +115,10 @@ if __name__ == '__main__':
         revision = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
     except Exception as _:
         revision = ''
+
     setuptools.setup(name='deep_ep',
                      version='1.2.1' + revision,
                      packages=setuptools.find_packages(include=['deep_ep']),
-                     install_requires=[],
-                     extras_require={
-                         'deepxtrace': [
-                             'deepxtrace>=0.2.0,<0.3.0',
-                         ],
-                     },
                      ext_modules=[
                          CUDAExtension(name='deep_ep_cpp',
                                        include_dirs=include_dirs,

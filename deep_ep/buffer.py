@@ -1,60 +1,13 @@
-import importlib
 import os
-import warnings
-import weakref
 import torch
 import torch.distributed as dist
-from typing import Callable, Dict, List, Tuple, Optional, Union
+from typing import Callable, List, Tuple, Optional, Union
 
 # noinspection PyUnresolvedReferences
 import deep_ep_cpp
 # noinspection PyUnresolvedReferences
 from deep_ep_cpp import Config, EventHandle
 from .utils import EventOverlap, check_nvlink_connections
-
-_REQUIRED_NORMAL_STATS_SCHEMA = (
-    "normal_notify_dispatch_full_kernel_duration_ns_stats",
-    "normal_notify_dispatch_full_kernel_count_stats",
-    "normal_cached_notify_dispatch_full_kernel_duration_ns_stats",
-    "normal_cached_notify_dispatch_full_kernel_count_stats",
-    "normal_cached_notify_combine_full_kernel_duration_ns_stats",
-    "normal_cached_notify_combine_full_kernel_count_stats",
-    "normal_dispatch_final_completion_cost_stats",
-    "normal_dispatch_final_completion_sample_count_stats",
-    "normal_dispatch_final_completion_token_count_stats",
-    "normal_dispatch_rdma_recv_completion_cost_stats",
-    "normal_dispatch_rdma_recv_completion_sample_count_stats",
-    "normal_dispatch_rdma_recv_completion_token_count_stats",
-    "normal_combine_logical_recv_completion_cost_stats",
-    "normal_combine_logical_recv_completion_sample_count_stats",
-    "normal_combine_logical_recv_completion_token_count_stats",
-)
-
-
-def _validate_deepxtrace_normal_stats_schema(diagnose_module) -> None:
-    actual_schema = getattr(diagnose_module, "NORMAL_STATS_SCHEMA", None)
-    if tuple(actual_schema or ()) != _REQUIRED_NORMAL_STATS_SCHEMA:
-        raise RuntimeError("Incompatible deepxtrace normal-stats schema: DeepEP requires "
-                           "deepxtrace>=0.2.0,<0.3.0 with fields ordered as "
-                           "notify -> dispatch -> combine, but found schema "
-                           f"{actual_schema!r}")
-
-
-def _load_deepxtrace(enable_deepxtrace: bool, has_torch_group: bool):
-    if not isinstance(enable_deepxtrace, bool):
-        raise TypeError("`enable_deepxtrace` must be a bool")
-    if not enable_deepxtrace:
-        return None, "disabled by configuration"
-    if not has_torch_group:
-        return None, ("the current DeepXTrace integration requires a "
-                      "torch.distributed process group")
-
-    try:
-        diagnose_module = importlib.import_module("deepxtrace.diagnose")
-        _validate_deepxtrace_normal_stats_schema(diagnose_module)
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
-    return diagnose_module, None
 
 
 class Buffer:
@@ -88,9 +41,7 @@ class Buffer:
             use_fabric: bool = False,
             explicitly_destroy: bool = False,
             enable_shrink: bool = False,
-            comm: Optional["mpi4py.MPI.Comm"] = None,  # noqa: F821
-            enable_deepxtrace: bool = False,
-            enable_deepxtrace_async: bool = True) -> None:
+            comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
         """
         Initialize the communication buffer.
 
@@ -112,19 +63,8 @@ class Buffer:
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
             comm: the `mpi4py.MPI.Comm` communicator to use in case the group parameter is absent.
-            enable_deepxtrace: whether to enable the optional DeepXTrace integration. DeepEP does not import or initialize
-                DeepXTrace unless this option is explicitly enabled on every EP rank.
-            enable_deepxtrace_async: whether to run DeepXTrace collection in
-                asynchronous mode. If enabled, the periodic background
-                collector uses ``DEEPEP_DIAGNOSE_INTERVAL``. If disabled, all
-                EP ranks must call
-                :meth:`diagnose_normal_sync` at the same logical step, and
-                ``DEEPEP_DIAGNOSE_SYNC_STEP`` controls the collection cadence.
         """
         check_nvlink_connections(group)
-        if not isinstance(enable_deepxtrace_async, bool):
-            raise TypeError("`enable_deepxtrace_async` must be a bool")
-        self.enable_deepxtrace_async = enable_deepxtrace_async
 
         # Initialize the CPP runtime
         if group is not None:
@@ -145,43 +85,6 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
-
-        diagnose_module, deepxtrace_error = _load_deepxtrace(enable_deepxtrace, group is not None)
-        local_deepxtrace_status = (
-            enable_deepxtrace,
-            diagnose_module is not None,
-            deepxtrace_error,
-            self.enable_deepxtrace_async,
-        )
-
-        deepxtrace_statuses = all_gather_object(local_deepxtrace_status)
-        all_deepxtrace_requested = all(status[0] for status in deepxtrace_statuses)
-        all_deepxtrace_ready = all(status[1] for status in deepxtrace_statuses)
-        if all_deepxtrace_requested:
-            configured_async_modes = {status[3] for status in deepxtrace_statuses}
-            if len(configured_async_modes) != 1:
-                raise RuntimeError("All EP ranks must use the same "
-                                   "`enable_deepxtrace_async`, but found "
-                                   f"{sorted(configured_async_modes)!r}")
-        self.deepxtrace_enabled = (all_deepxtrace_requested and all_deepxtrace_ready)
-        if (any(status[0] for status in deepxtrace_statuses) and not self.deepxtrace_enabled and self.rank == 0):
-            unavailable = [f"rank {rank}: {status[2]}" for rank, status in enumerate(deepxtrace_statuses) if not status[1]]
-            preview = "; ".join(unavailable[:8])
-            if len(unavailable) > 8:
-                preview += f"; ... and {len(unavailable) - 8} more ranks"
-            warnings.warn(
-                "DeepXTrace diagnosis is disabled for all ranks because "
-                f"the integration is not uniformly available: {preview}",
-                RuntimeWarning,
-                stacklevel=2)
-
-        self.diagnose = None
-        self._deepxtrace_finalizer = None
-        self._normal_diagnose_stats = {name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA}
-        self._normal_notify_full_kernel_timer_states = None
-        self._normal_notify_dispatch_full_kernel_timer_state = None
-        self._normal_cached_notify_dispatch_full_kernel_timer_state = None
-        self._normal_cached_notify_combine_full_kernel_timer_state = None
 
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
@@ -238,72 +141,18 @@ class Buffer:
         self.runtime.sync(device_ids, ipc_handles, root_unique_id)
         assert self.runtime.is_available()
 
-        # Start DeepXTrace
-        # LL diagnosis is intentionally disabled by DeepEP for now. Normal
-        # diagnostics instrument the normal dispatch/combine APIs and remain
-        # available when the runtime uses the low-latency NVSHMEM topology.
-        if self.deepxtrace_enabled:
-            self._initialize_normal_notify_timer_states()
-            self.diagnose = diagnose_module.Diagnose(group=group,
-                                                     enable_ll_diagnose=False,
-                                                     enable_normal_diagnose=True,
-                                                     enable_async=self.enable_deepxtrace_async,
-                                                     snapshot_stream=self.get_comm_stream())
-            self._normal_diagnose_stats = self._get_normal_diagnose_stats()
-            if self.enable_deepxtrace_async:
-                self.diagnose.start_async_diagnose()
-                self._deepxtrace_finalizer = weakref.finalize(self, self.diagnose.stop_async_diagnose)
-        # End DeepXTrace
-
-    def _initialize_normal_notify_timer_states(self) -> None:
-        """Create persistent per-launch notify timer scratch owned by DeepEP.
-
-        Each row is ``[inverted earliest start, completed blocks]``. C++ resets
-        the selected row on the communication stream immediately before the
-        corresponding kernel launch, so the pointers remain CUDA-graph stable.
-        """
-        self._normal_notify_full_kernel_timer_states = torch.zeros((3, 2), dtype=torch.int64, device="cuda")
-        self._normal_notify_dispatch_full_kernel_timer_state = \
-            self._normal_notify_full_kernel_timer_states[0]
-        self._normal_cached_notify_dispatch_full_kernel_timer_state = \
-            self._normal_notify_full_kernel_timer_states[1]
-        self._normal_cached_notify_combine_full_kernel_timer_state = \
-            self._normal_notify_full_kernel_timer_states[2]
-
     @staticmethod
-    def _select_normal_notify_timer_state(duration_stats: Optional[torch.Tensor], count_stats: Optional[torch.Tensor],
-                                          timer_state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if (duration_stats is None) != (count_stats is None):
-            raise RuntimeError("DeepXTrace notify duration/count tensors must be enabled "
-                               "or disabled together")
-        return timer_state if duration_stats is not None else None
-
-    def _get_normal_diagnose_stats(self) -> Dict[str, Optional[torch.Tensor]]:
-        tensors = self.diagnose.get_stats_normal_stats_tensor()
-        if len(tensors) != len(_REQUIRED_NORMAL_STATS_SCHEMA):
-            raise RuntimeError("DeepXTrace normal-stats tensor count does not match its "
-                               "schema: "
-                               f"{len(tensors)} != {len(_REQUIRED_NORMAL_STATS_SCHEMA)}")
-        return dict(zip(_REQUIRED_NORMAL_STATS_SCHEMA, tensors))
-
-    def diagnose_normal_sync(self, diagnose_step: int = 0):
-        """Collect normal DeepXTrace statistics at a caller-owned step boundary.
-
-        Every rank in the EP group must call this method at the same logical
-        location and with the same cadence. Mismatched calls can deadlock the
-        diagnostic collectives or assign samples to different windows.
-        ``DEEPEP_DIAGNOSE_SYNC_STEP`` is used when ``diagnose_step`` is zero;
-        a nonzero value overrides it.
-
-        Returns ``None`` when DeepXTrace is disabled. In async mode, collection
-        is owned by the background thread and this method raises.
-        """
-        if self.diagnose is None:
-            return None
-        if self.enable_deepxtrace_async:
-            raise RuntimeError("diagnose_normal_sync() requires "
-                               "`enable_deepxtrace_async=False`")
-        return self.diagnose.diagnose_normal_sync(diagnose_step)
+    def _unpack_normal_stats(
+            stats: Optional[Tuple[Optional[torch.Tensor], ...]],
+            expected_count: int,
+            argument_name: str) -> Tuple[Optional[torch.Tensor], ...]:
+        if stats is None:
+            return (None,) * expected_count
+        if len(stats) != expected_count:
+            raise ValueError(
+                f"`{argument_name}` must contain {expected_count} tensors, "
+                f"but got {len(stats)}")
+        return stats
 
     @staticmethod
     def disable_ll_layered() -> bool:
@@ -320,24 +169,8 @@ class Buffer:
 
         assert self.explicitly_destroy, '`explicitly_destroy` flag must be set'
 
-        self._stop_deepxtrace()
         self.runtime.destroy()
         self.runtime = None
-
-    def _stop_deepxtrace(self) -> None:
-        """Stop the optional background collector before runtime teardown."""
-        finalizer = getattr(self, "_deepxtrace_finalizer", None)
-        if finalizer is not None and finalizer.alive:
-            finalizer()
-        elif (getattr(self, "diagnose", None) is not None and getattr(self, "enable_deepxtrace_async", False)):
-            self.diagnose.stop_async_diagnose()
-        self._deepxtrace_finalizer = None
-        self.diagnose = None
-        self._normal_diagnose_stats = {name: None for name in _REQUIRED_NORMAL_STATS_SCHEMA}
-        self._normal_notify_full_kernel_timer_states = None
-        self._normal_notify_dispatch_full_kernel_timer_state = None
-        self._normal_cached_notify_dispatch_full_kernel_timer_state = None
-        self._normal_cached_notify_combine_full_kernel_timer_state = None
 
     @staticmethod
     def is_sm90_compiled():
@@ -521,7 +354,8 @@ class Buffer:
                  expert_alignment: int = 1, num_worst_tokens: int = 0,
                  config: Optional[Config] = None,
                  previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                 allocate_on_comm_stream: bool = False) -> \
+                 allocate_on_comm_stream: bool = False,
+                 normal_dispatch_stats: Optional[Tuple[Optional[torch.Tensor], ...]] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
                   Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -551,6 +385,9 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            normal_dispatch_stats: optional opaque bundle of ten cumulative
+                normal-mode probe tensors. Pass the value returned by the
+                external diagnostics provider directly. Internode only.
 
         Returns:
             recv_x: received tokens, the same type and tuple as the input `x`, but the number of tokens equals to the
@@ -570,7 +407,7 @@ class Buffer:
         if self.runtime.get_num_rdma_ranks() > 1:
             return self.internode_dispatch(x, handle, num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank,
                                            num_tokens_per_expert, topk_idx, topk_weights, expert_alignment, num_worst_tokens, config,
-                                           previous_event, async_finish, allocate_on_comm_stream)
+                                           previous_event, async_finish, allocate_on_comm_stream, normal_dispatch_stats)
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
@@ -601,7 +438,8 @@ class Buffer:
                 bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                 config: Optional[Config] = None,
                 previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                allocate_on_comm_stream: bool = False) -> \
+                allocate_on_comm_stream: bool = False,
+                normal_combine_stats: Optional[Tuple[Optional[torch.Tensor], ...]] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Combine (reduce) tokens (addition **without** weights) from different ranks, both intranode and internode
@@ -619,6 +457,9 @@ class Buffer:
             previous_event: the event to wait before actually executing the kernel.
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the communication stream.
+            normal_combine_stats: optional opaque bundle of five cumulative
+                normal-mode probe tensors. Pass the value returned by the
+                external diagnostics provider directly. Internode only.
 
         Returns:
             recv_x: the reduced token from its dispatched ranks.
@@ -630,7 +471,8 @@ class Buffer:
 
         # Internode
         if self.runtime.get_num_rdma_ranks() > 1:
-            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish, allocate_on_comm_stream)
+            return self.internode_combine(x, handle, topk_weights, bias, config, previous_event, async_finish,
+                                          allocate_on_comm_stream, normal_combine_stats)
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
         rank_prefix_matrix, _, channel_prefix_matrix, src_idx, is_recv_token_in_rank, send_head = handle
@@ -651,7 +493,8 @@ class Buffer:
                            topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None, expert_alignment: int = 1,
                            num_worst_tokens: int = 0, config: Optional[Config] = None,
                            previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                           allocate_on_comm_stream: bool = False) -> \
+                           allocate_on_comm_stream: bool = False,
+                           normal_dispatch_stats: Optional[Tuple[Optional[torch.Tensor], ...]] = None) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], Optional[torch.Tensor],
             Optional[torch.Tensor], List[int], Tuple, EventOverlap]:
         """
@@ -662,28 +505,18 @@ class Buffer:
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
-        normal_stats = self._normal_diagnose_stats
-        normal_notify_dispatch_full_kernel_duration_ns_stats = normal_stats["normal_notify_dispatch_full_kernel_duration_ns_stats"]
-        normal_notify_dispatch_full_kernel_count_stats = normal_stats["normal_notify_dispatch_full_kernel_count_stats"]
-        normal_notify_dispatch_full_kernel_timer_state = \
-            self._select_normal_notify_timer_state(
-                normal_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_notify_dispatch_full_kernel_count_stats,
-                self._normal_notify_dispatch_full_kernel_timer_state)
-        normal_cached_notify_dispatch_full_kernel_duration_ns_stats = normal_stats[
-            "normal_cached_notify_dispatch_full_kernel_duration_ns_stats"]
-        normal_cached_notify_dispatch_full_kernel_count_stats = normal_stats["normal_cached_notify_dispatch_full_kernel_count_stats"]
-        normal_cached_notify_dispatch_full_kernel_timer_state = \
-            self._select_normal_notify_timer_state(
-                normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_cached_notify_dispatch_full_kernel_count_stats,
-                self._normal_cached_notify_dispatch_full_kernel_timer_state)
-        normal_dispatch_final_completion_cost_stats = normal_stats["normal_dispatch_final_completion_cost_stats"]
-        normal_dispatch_final_completion_sample_count_stats = normal_stats["normal_dispatch_final_completion_sample_count_stats"]
-        normal_dispatch_final_completion_token_count_stats = normal_stats["normal_dispatch_final_completion_token_count_stats"]
-        normal_dispatch_rdma_recv_completion_cost_stats = normal_stats["normal_dispatch_rdma_recv_completion_cost_stats"]
-        normal_dispatch_rdma_recv_completion_sample_count_stats = normal_stats["normal_dispatch_rdma_recv_completion_sample_count_stats"]
-        normal_dispatch_rdma_recv_completion_token_count_stats = normal_stats["normal_dispatch_rdma_recv_completion_token_count_stats"]
+        normal_notify_dispatch_full_kernel_duration_ns_stats, \
+            normal_notify_dispatch_full_kernel_count_stats, \
+            normal_cached_notify_dispatch_full_kernel_duration_ns_stats, \
+            normal_cached_notify_dispatch_full_kernel_count_stats, \
+            normal_dispatch_final_completion_cost_stats, \
+            normal_dispatch_final_completion_sample_count_stats, \
+            normal_dispatch_final_completion_token_count_stats, \
+            normal_dispatch_rdma_recv_completion_cost_stats, \
+            normal_dispatch_rdma_recv_completion_sample_count_stats, \
+            normal_dispatch_rdma_recv_completion_token_count_stats = \
+            self._unpack_normal_stats(
+                normal_dispatch_stats, 10, "normal_dispatch_stats")
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -700,9 +533,9 @@ class Buffer:
                 normal_dispatch_final_completion_sample_count_stats, normal_dispatch_final_completion_token_count_stats,
                 normal_dispatch_rdma_recv_completion_cost_stats, normal_dispatch_rdma_recv_completion_sample_count_stats,
                 normal_dispatch_rdma_recv_completion_token_count_stats, normal_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_notify_dispatch_full_kernel_count_stats, normal_notify_dispatch_full_kernel_timer_state,
+                normal_notify_dispatch_full_kernel_count_stats,
                 normal_cached_notify_dispatch_full_kernel_duration_ns_stats, normal_cached_notify_dispatch_full_kernel_count_stats,
-                normal_cached_notify_dispatch_full_kernel_timer_state)
+            )
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -723,10 +556,8 @@ class Buffer:
                 normal_dispatch_rdma_recv_completion_token_count_stats,
                 normal_notify_dispatch_full_kernel_duration_ns_stats,
                 normal_notify_dispatch_full_kernel_count_stats,
-                normal_notify_dispatch_full_kernel_timer_state,
                 normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_cached_notify_dispatch_full_kernel_count_stats,
-                normal_cached_notify_dispatch_full_kernel_timer_state)
+                normal_cached_notify_dispatch_full_kernel_count_stats)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
@@ -741,7 +572,8 @@ class Buffer:
                           bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]] = None,
                           config: Optional[Config] = None,
                           previous_event: Optional[EventOverlap] = None, async_finish: bool = False,
-                          allocate_on_comm_stream: bool = False) -> \
+                          allocate_on_comm_stream: bool = False,
+                          normal_combine_stats: Optional[Tuple[Optional[torch.Tensor], ...]] = None) -> \
             Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         """
         Internode combine implementation, for more details, please refer to the `combine` docs.
@@ -755,19 +587,13 @@ class Buffer:
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, gbl_rank_prefix_sum, \
             src_meta, send_rdma_head, send_nvl_head = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
-        normal_stats = self._normal_diagnose_stats
-        normal_cached_notify_combine_full_kernel_duration_ns_stats = normal_stats[
-            "normal_cached_notify_combine_full_kernel_duration_ns_stats"]
-        normal_cached_notify_combine_full_kernel_count_stats = normal_stats["normal_cached_notify_combine_full_kernel_count_stats"]
-        normal_cached_notify_combine_full_kernel_timer_state = \
-            self._select_normal_notify_timer_state(
-                normal_cached_notify_combine_full_kernel_duration_ns_stats,
-                normal_cached_notify_combine_full_kernel_count_stats,
-                self._normal_cached_notify_combine_full_kernel_timer_state)
-        normal_combine_logical_recv_completion_cost_stats = normal_stats["normal_combine_logical_recv_completion_cost_stats"]
-        normal_combine_logical_recv_completion_sample_count_stats = normal_stats[
-            "normal_combine_logical_recv_completion_sample_count_stats"]
-        normal_combine_logical_recv_completion_token_count_stats = normal_stats["normal_combine_logical_recv_completion_token_count_stats"]
+        normal_cached_notify_combine_full_kernel_duration_ns_stats, \
+            normal_cached_notify_combine_full_kernel_count_stats, \
+            normal_combine_logical_recv_completion_cost_stats, \
+            normal_combine_logical_recv_completion_sample_count_stats, \
+            normal_combine_logical_recv_completion_token_count_stats = \
+            self._unpack_normal_stats(
+                normal_combine_stats, 5, "normal_combine_stats")
 
         # Launch the kernel
         combined_x, combined_topk_weights, event = self.runtime.internode_combine(
@@ -775,8 +601,8 @@ class Buffer:
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, send_rdma_head, send_nvl_head, config,
             getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
             normal_cached_notify_combine_full_kernel_duration_ns_stats, normal_cached_notify_combine_full_kernel_count_stats,
-            normal_cached_notify_combine_full_kernel_timer_state, normal_combine_logical_recv_completion_cost_stats,
-            normal_combine_logical_recv_completion_sample_count_stats, normal_combine_logical_recv_completion_token_count_stats)
+            normal_combine_logical_recv_completion_cost_stats, normal_combine_logical_recv_completion_sample_count_stats,
+            normal_combine_logical_recv_completion_token_count_stats)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:

@@ -99,6 +99,9 @@ private:
     // Workspace
     void* workspace = nullptr;
 
+    // Per-launch scratch for the three normal-mode Notify timers
+    int64_t* normal_notify_full_kernel_timer_states = nullptr;
+
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
@@ -244,10 +247,8 @@ public:
                        const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_token_count_stats = std::nullopt,
                        const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
                        const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_timer_state = std::nullopt,
                        const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_timer_state = std::nullopt);
+                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats = std::nullopt);
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
         const torch::Tensor& x,
@@ -267,7 +268,6 @@ public:
         bool allocate_on_comm_stream,
         const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats = std::nullopt,
         const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_timer_state = std::nullopt,
         const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_cost_stats = std::nullopt,
         const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_sample_count_stats = std::nullopt,
         const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_token_count_stats = std::nullopt);
