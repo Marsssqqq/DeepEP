@@ -29,19 +29,18 @@ class Buffer:
 
     num_sms: int = 20
 
-    def __init__(
-            self,
-            group: Optional[dist.ProcessGroup],
-            num_nvl_bytes: int = 0,
-            num_rdma_bytes: int = 0,
-            low_latency_mode: bool = False,
-            num_qps_per_rank: int = 24,
-            allow_nvlink_for_low_latency_mode: bool = True,
-            allow_mnnvl: bool = False,
-            use_fabric: bool = False,
-            explicitly_destroy: bool = False,
-            enable_shrink: bool = False,
-            comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
+    def __init__(self,
+                 group: Optional[dist.ProcessGroup],
+                 num_nvl_bytes: int = 0,
+                 num_rdma_bytes: int = 0,
+                 low_latency_mode: bool = False,
+                 num_qps_per_rank: int = 24,
+                 allow_nvlink_for_low_latency_mode: bool = True,
+                 allow_mnnvl: bool = False,
+                 use_fabric: bool = False,
+                 explicitly_destroy: bool = False,
+                 enable_shrink: bool = False,
+                 comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
         """
         Initialize the communication buffer.
 
@@ -85,7 +84,6 @@ class Buffer:
                 return comm.allgather(obj)
         else:
             raise ValueError("Either 'group' or 'comm' must be provided.")
-
         self.num_nvl_bytes = num_nvl_bytes
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
