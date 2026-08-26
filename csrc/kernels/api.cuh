@@ -144,6 +144,18 @@ namespace internode {
 
 int get_source_meta_bytes();
 
+struct NormalNotifyStats {
+    int64_t* duration_ns = nullptr;
+    int64_t* count = nullptr;
+    int64_t* timer_state = nullptr;
+};
+
+struct NormalCompletionStats {
+    int64_t* cost = nullptr;
+    int64_t* sample_count = nullptr;
+    int64_t* token_count = nullptr;
+};
+
 void notify_dispatch(const int* num_tokens_per_rank,
                      int* moe_recv_counter_mapped,
                      int num_ranks,
@@ -174,9 +186,7 @@ void notify_dispatch(const int* num_tokens_per_rank,
                      int64_t num_rdma_bytes,
                      int64_t num_nvl_bytes,
                      bool low_latency_mode,
-                     int64_t* normal_notify_dispatch_full_kernel_duration_ns_stats,
-                     int64_t* normal_notify_dispatch_full_kernel_count_stats,
-                     int64_t* normal_notify_dispatch_full_kernel_timer_state);
+                     NormalNotifyStats normal_notify_stats);
 
 void dispatch(void* recv_x,
               float* recv_x_scales,
@@ -212,12 +222,8 @@ void dispatch(void* recv_x,
               int num_max_nvl_chunked_recv_tokens,
               // Completion cost tensors accumulate clock64() SM cycles;
               // Notify duration tensors accumulate %globaltimer nanoseconds.
-              int64_t* normal_dispatch_final_completion_cost_stats,
-              int64_t* normal_dispatch_final_completion_sample_count_stats,
-              int64_t* normal_dispatch_final_completion_token_count_stats,
-              int64_t* normal_dispatch_rdma_recv_completion_cost_stats,
-              int64_t* normal_dispatch_rdma_recv_completion_sample_count_stats,
-              int64_t* normal_dispatch_rdma_recv_completion_token_count_stats,
+              NormalCompletionStats normal_final_completion_stats,
+              NormalCompletionStats normal_rdma_recv_completion_stats,
               int rank,
               int num_ranks,
               bool is_cached_dispatch,
@@ -247,9 +253,7 @@ void cached_notify(int hidden_int4,
                    int64_t num_nvl_bytes,
                    bool is_cached_dispatch,
                    bool low_latency_mode,
-                   int64_t* normal_cached_notify_full_kernel_duration_ns_stats,
-                   int64_t* normal_cached_notify_full_kernel_count_stats,
-                   int64_t* normal_cached_notify_full_kernel_timer_state);
+                   NormalNotifyStats normal_notify_stats);
 
 void combine(cudaDataType_t type,
              void* combined_x,
@@ -277,9 +281,7 @@ void combine(cudaDataType_t type,
              int num_max_nvl_chunked_recv_tokens,
              // Completion cost tensors accumulate clock64() SM cycles;
              // Notify duration tensors accumulate %globaltimer nanoseconds.
-             int64_t* normal_combine_logical_recv_completion_cost_stats,
-             int64_t* normal_combine_logical_recv_completion_sample_count_stats,
-             int64_t* normal_combine_logical_recv_completion_token_count_stats,
+             NormalCompletionStats normal_logical_recv_completion_stats,
              int rank,
              int num_ranks,
              cudaStream_t stream,

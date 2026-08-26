@@ -125,6 +125,49 @@ void SharedMemoryAllocator::close_mem_handle(void* ptr) {
 
 namespace deep_ep {
 
+namespace {
+
+internode::NormalNotifyStats prepare_normal_notify_stats(const NormalNotifyStats& stats, int64_t* timer_state) {
+    const bool enabled = stats.duration_ns.has_value();
+    EP_HOST_ASSERT(stats.count.has_value() == enabled);
+    if (not enabled)
+        return {};
+
+    EP_HOST_ASSERT(stats.duration_ns->is_cuda() and stats.count->is_cuda());
+    EP_HOST_ASSERT(stats.duration_ns->scalar_type() == torch::kInt64 and stats.count->scalar_type() == torch::kInt64);
+    EP_HOST_ASSERT(stats.duration_ns->dim() == 1 and stats.duration_ns->numel() == 1 and stats.duration_ns->is_contiguous());
+    EP_HOST_ASSERT(stats.count->dim() == 1 and stats.count->numel() == 1 and stats.count->is_contiguous());
+
+    return {
+        stats.duration_ns->data_ptr<int64_t>(),
+        stats.count->data_ptr<int64_t>(),
+        timer_state,
+    };
+}
+
+internode::NormalCompletionStats prepare_normal_completion_stats(const NormalCompletionStats& stats, int num_ranks) {
+    const bool enabled = stats.cost.has_value();
+    EP_HOST_ASSERT(stats.sample_count.has_value() == enabled);
+    EP_HOST_ASSERT(stats.token_count.has_value() == enabled);
+    if (not enabled)
+        return {};
+
+    for (const auto& tensor : {stats.cost, stats.sample_count, stats.token_count}) {
+        EP_HOST_ASSERT(tensor->is_cuda());
+        EP_HOST_ASSERT(tensor->scalar_type() == torch::kInt64);
+        EP_HOST_ASSERT(tensor->dim() == 1 and tensor->is_contiguous());
+        EP_HOST_ASSERT(tensor->numel() == num_ranks);
+    }
+
+    return {
+        stats.cost->data_ptr<int64_t>(),
+        stats.sample_count->data_ptr<int64_t>(),
+        stats.token_count->data_ptr<int64_t>(),
+    };
+}
+
+}  // namespace
+
 Buffer::Buffer(int rank,
                int num_ranks,
                int64_t num_nvl_bytes,
@@ -949,16 +992,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream,
-                           const std::optional<torch::Tensor>& normal_dispatch_final_completion_cost_stats,
-                           const std::optional<torch::Tensor>& normal_dispatch_final_completion_sample_count_stats,
-                           const std::optional<torch::Tensor>& normal_dispatch_final_completion_token_count_stats,
-                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_cost_stats,
-                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_sample_count_stats,
-                           const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_token_count_stats,
-                           const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats,
-                           const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats,
-                           const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
-                           const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats) {
+                           const NormalDispatchStats& normal_stats) {
 #ifndef DISABLE_NVSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1016,48 +1050,10 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) % num_ranks == 0);
         EP_HOST_ASSERT(num_tokens_per_expert->size(0) / num_ranks <= NUM_MAX_LOCAL_EXPERTS);
     }
-    auto check_normal_dispatch_stat_tensor = [=](const std::optional<torch::Tensor>& stats) {
-        if (stats.has_value()) {
-            EP_HOST_ASSERT(stats->scalar_type() == torch::kInt64);
-            EP_HOST_ASSERT(stats->dim() == 1 and stats->is_contiguous());
-            EP_HOST_ASSERT(stats->size(0) == num_ranks);
-        }
-    };
-    auto check_normal_dispatch_stat_triplet = [&](const std::optional<torch::Tensor>& cost_stats,
-                                                  const std::optional<torch::Tensor>& sample_count_stats,
-                                                  const std::optional<torch::Tensor>& token_count_stats) {
-        const bool enabled = cost_stats.has_value();
-        EP_HOST_ASSERT(sample_count_stats.has_value() == enabled);
-        EP_HOST_ASSERT(token_count_stats.has_value() == enabled);
-        check_normal_dispatch_stat_tensor(cost_stats);
-        check_normal_dispatch_stat_tensor(sample_count_stats);
-        check_normal_dispatch_stat_tensor(token_count_stats);
-    };
-    check_normal_dispatch_stat_triplet(normal_dispatch_final_completion_cost_stats,
-                                       normal_dispatch_final_completion_sample_count_stats,
-                                       normal_dispatch_final_completion_token_count_stats);
-    check_normal_dispatch_stat_triplet(normal_dispatch_rdma_recv_completion_cost_stats,
-                                       normal_dispatch_rdma_recv_completion_sample_count_stats,
-                                       normal_dispatch_rdma_recv_completion_token_count_stats);
-    auto check_normal_notify_stats = [](const std::optional<torch::Tensor>& duration_ns_stats,
-                                        const std::optional<torch::Tensor>& count_stats) {
-        const bool enabled = duration_ns_stats.has_value();
-        EP_HOST_ASSERT(count_stats.has_value() == enabled);
-        if (enabled) {
-            EP_HOST_ASSERT(duration_ns_stats->scalar_type() == torch::kInt64 and count_stats->scalar_type() == torch::kInt64);
-            EP_HOST_ASSERT(duration_ns_stats->dim() == 1 and duration_ns_stats->numel() == 1 and duration_ns_stats->is_contiguous());
-            EP_HOST_ASSERT(count_stats->dim() == 1 and count_stats->numel() == 1 and count_stats->is_contiguous());
-        }
-    };
-    check_normal_notify_stats(normal_notify_dispatch_full_kernel_duration_ns_stats,
-                              normal_notify_dispatch_full_kernel_count_stats);
-    check_normal_notify_stats(normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
-                              normal_cached_notify_dispatch_full_kernel_count_stats);
-
-    auto* normal_notify_dispatch_full_kernel_timer_state =
-        normal_notify_dispatch_full_kernel_duration_ns_stats.has_value() ? normal_notify_full_kernel_timer_states : nullptr;
-    auto* normal_cached_notify_dispatch_full_kernel_timer_state =
-        normal_cached_notify_dispatch_full_kernel_duration_ns_stats.has_value() ? normal_notify_full_kernel_timer_states + 2 : nullptr;
+    const auto notify_stats = prepare_normal_notify_stats(normal_stats.notify, normal_notify_full_kernel_timer_states);
+    const auto cached_notify_stats = prepare_normal_notify_stats(normal_stats.cached_notify, normal_notify_full_kernel_timer_states + 2);
+    const auto final_completion_stats = prepare_normal_completion_stats(normal_stats.final_completion, num_ranks);
+    const auto rdma_recv_completion_stats = prepare_normal_completion_stats(normal_stats.rdma_recv_completion, num_ranks);
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1)),
          hidden_int4 = static_cast<int>(x.size(1) * x.element_size() / sizeof(int4));
@@ -1149,13 +1145,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  num_nvl_bytes,
                                  true,
                                  low_latency_mode,
-                                 normal_cached_notify_dispatch_full_kernel_duration_ns_stats.has_value()
-                                     ? normal_cached_notify_dispatch_full_kernel_duration_ns_stats->data_ptr<int64_t>()
-                                     : nullptr,
-                                 normal_cached_notify_dispatch_full_kernel_count_stats.has_value()
-                                     ? normal_cached_notify_dispatch_full_kernel_count_stats->data_ptr<int64_t>()
-                                     : nullptr,
-                                 normal_cached_notify_dispatch_full_kernel_timer_state);
+                                 cached_notify_stats);
     } else {
         rdma_channel_prefix_matrix = torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
         recv_rdma_rank_prefix_sum = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
@@ -1166,43 +1156,37 @@ Buffer::internode_dispatch(const torch::Tensor& x,
         *moe_recv_counter = -1, *moe_recv_rdma_counter = -1;
         for (int i = 0; i < num_local_experts; ++i)
             moe_recv_expert_counter[i] = -1;
-        internode::notify_dispatch(
-            num_tokens_per_rank->data_ptr<int>(),
-            moe_recv_counter_mapped,
-            num_ranks,
-            num_tokens_per_rdma_rank->data_ptr<int>(),
-            moe_recv_rdma_counter_mapped,
-            num_tokens_per_expert->data_ptr<int>(),
-            moe_recv_expert_counter_mapped,
-            num_experts,
-            is_token_in_rank.data_ptr<bool>(),
-            num_tokens,
-            num_worst_tokens,
-            num_channels,
-            hidden_int4,
-            num_scales,
-            num_topk,
-            expert_alignment,
-            rdma_channel_prefix_matrix.data_ptr<int>(),
-            recv_rdma_rank_prefix_sum.data_ptr<int>(),
-            gbl_channel_prefix_matrix.data_ptr<int>(),
-            recv_gbl_rank_prefix_sum.data_ptr<int>(),
-            rdma_buffer_ptr,
-            config.num_max_rdma_chunked_recv_tokens,
-            buffer_ptrs_gpu,
-            config.num_max_nvl_chunked_recv_tokens,
-            barrier_signal_ptrs_gpu,
-            rank,
-            comm_stream,
-            config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-            num_nvl_bytes,
-            low_latency_mode,
-            normal_notify_dispatch_full_kernel_duration_ns_stats.has_value()
-                ? normal_notify_dispatch_full_kernel_duration_ns_stats->data_ptr<int64_t>()
-                : nullptr,
-            normal_notify_dispatch_full_kernel_count_stats.has_value() ? normal_notify_dispatch_full_kernel_count_stats->data_ptr<int64_t>()
-                                                                       : nullptr,
-            normal_notify_dispatch_full_kernel_timer_state);
+        internode::notify_dispatch(num_tokens_per_rank->data_ptr<int>(),
+                                   moe_recv_counter_mapped,
+                                   num_ranks,
+                                   num_tokens_per_rdma_rank->data_ptr<int>(),
+                                   moe_recv_rdma_counter_mapped,
+                                   num_tokens_per_expert->data_ptr<int>(),
+                                   moe_recv_expert_counter_mapped,
+                                   num_experts,
+                                   is_token_in_rank.data_ptr<bool>(),
+                                   num_tokens,
+                                   num_worst_tokens,
+                                   num_channels,
+                                   hidden_int4,
+                                   num_scales,
+                                   num_topk,
+                                   expert_alignment,
+                                   rdma_channel_prefix_matrix.data_ptr<int>(),
+                                   recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                                   gbl_channel_prefix_matrix.data_ptr<int>(),
+                                   recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                                   rdma_buffer_ptr,
+                                   config.num_max_rdma_chunked_recv_tokens,
+                                   buffer_ptrs_gpu,
+                                   config.num_max_nvl_chunked_recv_tokens,
+                                   barrier_signal_ptrs_gpu,
+                                   rank,
+                                   comm_stream,
+                                   config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                                   num_nvl_bytes,
+                                   low_latency_mode,
+                                   notify_stats);
 
         // Synchronize total received tokens and tokens per expert
         if (num_worst_tokens > 0) {
@@ -1271,61 +1255,46 @@ Buffer::internode_dispatch(const torch::Tensor& x,
 
     // Launch data dispatch
     // NOTES: the buffer size checks are moved into the `.cu` file
-    internode::dispatch(
-        recv_x.data_ptr(),
-        recv_x_scales_ptr,
-        recv_topk_idx_ptr,
-        recv_topk_weights_ptr,
-        cached_mode ? nullptr : recv_src_meta->data_ptr(),
-        x.data_ptr(),
-        x_scales_ptr,
-        topk_idx_ptr,
-        topk_weights_ptr,
-        cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
-        cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
-        cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
-        cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
-        rdma_channel_prefix_matrix.data_ptr<int>(),
-        recv_rdma_rank_prefix_sum.data_ptr<int>(),
-        gbl_channel_prefix_matrix.data_ptr<int>(),
-        recv_gbl_rank_prefix_sum.data_ptr<int>(),
-        is_token_in_rank.data_ptr<bool>(),
-        num_tokens,
-        num_worst_tokens,
-        hidden_int4,
-        num_scales,
-        num_topk,
-        num_experts,
-        scale_token_stride,
-        scale_hidden_stride,
-        rdma_buffer_ptr,
-        config.num_max_rdma_chunked_send_tokens,
-        config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_send_tokens,
-        config.num_max_nvl_chunked_recv_tokens,
-        normal_dispatch_final_completion_cost_stats.has_value() ? normal_dispatch_final_completion_cost_stats->data_ptr<int64_t>()
-                                                                : nullptr,
-        normal_dispatch_final_completion_sample_count_stats.has_value()
-            ? normal_dispatch_final_completion_sample_count_stats->data_ptr<int64_t>()
-            : nullptr,
-        normal_dispatch_final_completion_token_count_stats.has_value()
-            ? normal_dispatch_final_completion_token_count_stats->data_ptr<int64_t>()
-            : nullptr,
-        normal_dispatch_rdma_recv_completion_cost_stats.has_value() ? normal_dispatch_rdma_recv_completion_cost_stats->data_ptr<int64_t>()
-                                                                    : nullptr,
-        normal_dispatch_rdma_recv_completion_sample_count_stats.has_value()
-            ? normal_dispatch_rdma_recv_completion_sample_count_stats->data_ptr<int64_t>()
-            : nullptr,
-        normal_dispatch_rdma_recv_completion_token_count_stats.has_value()
-            ? normal_dispatch_rdma_recv_completion_token_count_stats->data_ptr<int64_t>()
-            : nullptr,
-        rank,
-        num_ranks,
-        cached_mode,
-        comm_stream,
-        num_channels,
-        low_latency_mode);
+    internode::dispatch(recv_x.data_ptr(),
+                        recv_x_scales_ptr,
+                        recv_topk_idx_ptr,
+                        recv_topk_weights_ptr,
+                        cached_mode ? nullptr : recv_src_meta->data_ptr(),
+                        x.data_ptr(),
+                        x_scales_ptr,
+                        topk_idx_ptr,
+                        topk_weights_ptr,
+                        cached_mode ? nullptr : send_rdma_head->data_ptr<int>(),
+                        cached_mode ? nullptr : send_nvl_head->data_ptr<int>(),
+                        cached_mode ? nullptr : recv_rdma_channel_prefix_matrix->data_ptr<int>(),
+                        cached_mode ? nullptr : recv_gbl_channel_prefix_matrix->data_ptr<int>(),
+                        rdma_channel_prefix_matrix.data_ptr<int>(),
+                        recv_rdma_rank_prefix_sum.data_ptr<int>(),
+                        gbl_channel_prefix_matrix.data_ptr<int>(),
+                        recv_gbl_rank_prefix_sum.data_ptr<int>(),
+                        is_token_in_rank.data_ptr<bool>(),
+                        num_tokens,
+                        num_worst_tokens,
+                        hidden_int4,
+                        num_scales,
+                        num_topk,
+                        num_experts,
+                        scale_token_stride,
+                        scale_hidden_stride,
+                        rdma_buffer_ptr,
+                        config.num_max_rdma_chunked_send_tokens,
+                        config.num_max_rdma_chunked_recv_tokens,
+                        buffer_ptrs_gpu,
+                        config.num_max_nvl_chunked_send_tokens,
+                        config.num_max_nvl_chunked_recv_tokens,
+                        final_completion_stats,
+                        rdma_recv_completion_stats,
+                        rank,
+                        num_ranks,
+                        cached_mode,
+                        comm_stream,
+                        num_channels,
+                        low_latency_mode);
 
     // Wait streams
     std::optional<EventHandle> event;
@@ -1410,11 +1379,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle>& previous_event,
     bool async,
     bool allocate_on_comm_stream,
-    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats,
-    const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats,
-    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_cost_stats,
-    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_sample_count_stats,
-    const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_token_count_stats) {
+    const NormalCombineStats& normal_stats) {
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
@@ -1446,34 +1411,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     EP_HOST_ASSERT(combined_rdma_head.dim() == 2 and combined_rdma_head.size(0) == num_combined_tokens and
                    combined_rdma_head.size(1) == num_rdma_ranks);
     EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
-    const bool normal_cached_notify_combine_enabled = normal_cached_notify_combine_full_kernel_duration_ns_stats.has_value();
-    EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_count_stats.has_value() == normal_cached_notify_combine_enabled);
-    if (normal_cached_notify_combine_enabled) {
-        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_duration_ns_stats->scalar_type() == torch::kInt64 and
-                       normal_cached_notify_combine_full_kernel_count_stats->scalar_type() == torch::kInt64);
-        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_duration_ns_stats->dim() == 1 and
-                       normal_cached_notify_combine_full_kernel_duration_ns_stats->numel() == 1 and
-                       normal_cached_notify_combine_full_kernel_duration_ns_stats->is_contiguous());
-        EP_HOST_ASSERT(normal_cached_notify_combine_full_kernel_count_stats->dim() == 1 and
-                       normal_cached_notify_combine_full_kernel_count_stats->numel() == 1 and
-                       normal_cached_notify_combine_full_kernel_count_stats->is_contiguous());
-    }
-    auto* normal_cached_notify_combine_full_kernel_timer_state =
-        normal_cached_notify_combine_enabled ? normal_notify_full_kernel_timer_states + 4 : nullptr;
-    const bool enable_normal_combine_logical_recv_completion_stats = normal_combine_logical_recv_completion_cost_stats.has_value();
-    EP_HOST_ASSERT(normal_combine_logical_recv_completion_sample_count_stats.has_value() ==
-                   enable_normal_combine_logical_recv_completion_stats);
-    EP_HOST_ASSERT(normal_combine_logical_recv_completion_token_count_stats.has_value() ==
-                   enable_normal_combine_logical_recv_completion_stats);
-    for (const auto& stats : {normal_combine_logical_recv_completion_cost_stats,
-                              normal_combine_logical_recv_completion_sample_count_stats,
-                              normal_combine_logical_recv_completion_token_count_stats}) {
-        if (stats.has_value()) {
-            EP_HOST_ASSERT(stats->scalar_type() == torch::kInt64);
-            EP_HOST_ASSERT(stats->dim() == 1 and stats->is_contiguous());
-            EP_HOST_ASSERT(stats->numel() == num_ranks);
-        }
-    }
+    const auto cached_notify_stats = prepare_normal_notify_stats(normal_stats.cached_notify, normal_notify_full_kernel_timer_states + 4);
+    const auto logical_recv_completion_stats = prepare_normal_completion_stats(normal_stats.logical_recv_completion, num_ranks);
 
     // Allocate all tensors on comm stream if set
     // NOTES: do not allocate tensors upfront!
@@ -1510,32 +1449,29 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     EP_HOST_ASSERT(config.num_max_nvl_chunked_send_tokens <= config.num_max_nvl_chunked_recv_tokens / num_rdma_ranks);
 
     // Launch barrier and reset queue head and tail
-    internode::cached_notify(
-        hidden_int4,
-        0,
-        0,
-        num_topk,
-        num_ranks,
-        num_channels,
-        num_combined_tokens,
-        combined_rdma_head.data_ptr<int>(),
-        rdma_channel_prefix_matrix.data_ptr<int>(),
-        rdma_rank_prefix_sum.data_ptr<int>(),
-        combined_nvl_head.data_ptr<int>(),
-        rdma_buffer_ptr,
-        config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu,
-        config.num_max_nvl_chunked_recv_tokens,
-        barrier_signal_ptrs_gpu,
-        rank,
-        comm_stream,
-        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-        num_nvl_bytes,
-        false,
-        low_latency_mode,
-        normal_cached_notify_combine_enabled ? normal_cached_notify_combine_full_kernel_duration_ns_stats->data_ptr<int64_t>() : nullptr,
-        normal_cached_notify_combine_enabled ? normal_cached_notify_combine_full_kernel_count_stats->data_ptr<int64_t>() : nullptr,
-        normal_cached_notify_combine_full_kernel_timer_state);
+    internode::cached_notify(hidden_int4,
+                             0,
+                             0,
+                             num_topk,
+                             num_ranks,
+                             num_channels,
+                             num_combined_tokens,
+                             combined_rdma_head.data_ptr<int>(),
+                             rdma_channel_prefix_matrix.data_ptr<int>(),
+                             rdma_rank_prefix_sum.data_ptr<int>(),
+                             combined_nvl_head.data_ptr<int>(),
+                             rdma_buffer_ptr,
+                             config.num_max_rdma_chunked_recv_tokens,
+                             buffer_ptrs_gpu,
+                             config.num_max_nvl_chunked_recv_tokens,
+                             barrier_signal_ptrs_gpu,
+                             rank,
+                             comm_stream,
+                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                             num_nvl_bytes,
+                             false,
+                             low_latency_mode,
+                             cached_notify_stats);
 
     // Assign bias pointers
     auto bias_opts = std::vector<std::optional<torch::Tensor>>({bias_0, bias_1});
@@ -1575,15 +1511,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                        buffer_ptrs_gpu,
                        config.num_max_nvl_chunked_send_tokens,
                        config.num_max_nvl_chunked_recv_tokens,
-                       normal_combine_logical_recv_completion_cost_stats.has_value()
-                           ? normal_combine_logical_recv_completion_cost_stats->data_ptr<int64_t>()
-                           : nullptr,
-                       normal_combine_logical_recv_completion_sample_count_stats.has_value()
-                           ? normal_combine_logical_recv_completion_sample_count_stats->data_ptr<int64_t>()
-                           : nullptr,
-                       normal_combine_logical_recv_completion_token_count_stats.has_value()
-                           ? normal_combine_logical_recv_completion_token_count_stats->data_ptr<int64_t>()
-                           : nullptr,
+                       logical_recv_completion_stats,
                        rank,
                        num_ranks,
                        comm_stream,
@@ -1997,6 +1925,71 @@ void Buffer::low_latency_clean_mask_buffer() {
 
 }  // namespace deep_ep
 
+namespace {
+
+std::optional<torch::Tensor> cast_optional_tensor(pybind11::handle value) {
+    return value.is_none() ? std::nullopt : std::make_optional(pybind11::cast<torch::Tensor>(value));
+}
+
+pybind11::sequence require_normal_stats_sequence(pybind11::handle source, size_t expected_size, const char* argument_name) {
+    if (not pybind11::isinstance<pybind11::tuple>(source) and not pybind11::isinstance<pybind11::list>(source))
+        throw pybind11::value_error(std::string("`") + argument_name + "` must be a tuple or list");
+
+    auto sequence = pybind11::reinterpret_borrow<pybind11::sequence>(source);
+    if (static_cast<size_t>(sequence.size()) != expected_size)
+        throw pybind11::value_error(std::string("`") + argument_name + "` must contain " + std::to_string(expected_size) +
+                                    " tensors, but got " + std::to_string(sequence.size()));
+    return sequence;
+}
+
+}  // namespace
+
+namespace pybind11::detail {
+
+template <>
+struct type_caster<deep_ep::NormalDispatchStats> {
+public:
+    PYBIND11_TYPE_CASTER(deep_ep::NormalDispatchStats, const_name("NormalDispatchStats"));
+
+    bool load(handle source, bool) {
+        if (source.is_none()) {
+            value = {};
+            return true;
+        }
+
+        auto stats = require_normal_stats_sequence(source, 10, "normal_dispatch_stats");
+        value = {
+            {cast_optional_tensor(stats[0]), cast_optional_tensor(stats[1])},
+            {cast_optional_tensor(stats[2]), cast_optional_tensor(stats[3])},
+            {cast_optional_tensor(stats[4]), cast_optional_tensor(stats[5]), cast_optional_tensor(stats[6])},
+            {cast_optional_tensor(stats[7]), cast_optional_tensor(stats[8]), cast_optional_tensor(stats[9])},
+        };
+        return true;
+    }
+};
+
+template <>
+struct type_caster<deep_ep::NormalCombineStats> {
+public:
+    PYBIND11_TYPE_CASTER(deep_ep::NormalCombineStats, const_name("NormalCombineStats"));
+
+    bool load(handle source, bool) {
+        if (source.is_none()) {
+            value = {};
+            return true;
+        }
+
+        auto stats = require_normal_stats_sequence(source, 5, "normal_combine_stats");
+        value = {
+            {cast_optional_tensor(stats[0]), cast_optional_tensor(stats[1])},
+            {cast_optional_tensor(stats[2]), cast_optional_tensor(stats[3]), cast_optional_tensor(stats[4])},
+        };
+        return true;
+    }
+};
+
+}  // namespace pybind11::detail
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "DeepEP: an efficient expert-parallel communication library";
 
@@ -2053,16 +2046,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("previous_event"),
              py::arg("async"),
              py::arg("allocate_on_comm_stream"),
-             py::arg("normal_dispatch_final_completion_cost_stats") = py::none(),
-             py::arg("normal_dispatch_final_completion_sample_count_stats") = py::none(),
-             py::arg("normal_dispatch_final_completion_token_count_stats") = py::none(),
-             py::arg("normal_dispatch_rdma_recv_completion_cost_stats") = py::none(),
-             py::arg("normal_dispatch_rdma_recv_completion_sample_count_stats") = py::none(),
-             py::arg("normal_dispatch_rdma_recv_completion_token_count_stats") = py::none(),
-             py::arg("normal_notify_dispatch_full_kernel_duration_ns_stats") = py::none(),
-             py::arg("normal_notify_dispatch_full_kernel_count_stats") = py::none(),
-             py::arg("normal_cached_notify_dispatch_full_kernel_duration_ns_stats") = py::none(),
-             py::arg("normal_cached_notify_dispatch_full_kernel_count_stats") = py::none())
+             py::arg("normal_dispatch_stats") = py::none())
         .def("internode_combine",
              &deep_ep::Buffer::internode_combine,
              py::arg("x"),
@@ -2080,11 +2064,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("previous_event"),
              py::arg("async"),
              py::arg("allocate_on_comm_stream"),
-             py::arg("normal_cached_notify_combine_full_kernel_duration_ns_stats") = py::none(),
-             py::arg("normal_cached_notify_combine_full_kernel_count_stats") = py::none(),
-             py::arg("normal_combine_logical_recv_completion_cost_stats") = py::none(),
-             py::arg("normal_combine_logical_recv_completion_sample_count_stats") = py::none(),
-             py::arg("normal_combine_logical_recv_completion_token_count_stats") = py::none())
+             py::arg("normal_combine_stats") = py::none())
         .def("clean_low_latency_buffer", &deep_ep::Buffer::clean_low_latency_buffer)
         .def("low_latency_dispatch", &deep_ep::Buffer::low_latency_dispatch)
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)

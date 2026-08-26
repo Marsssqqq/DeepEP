@@ -140,19 +140,6 @@ class Buffer:
         assert self.runtime.is_available()
 
     @staticmethod
-    def _unpack_normal_stats(
-            stats: Optional[Tuple[Optional[torch.Tensor], ...]],
-            expected_count: int,
-            argument_name: str) -> Tuple[Optional[torch.Tensor], ...]:
-        if stats is None:
-            return (None,) * expected_count
-        if len(stats) != expected_count:
-            raise ValueError(
-                f"`{argument_name}` must contain {expected_count} tensors, "
-                f"but got {len(stats)}")
-        return stats
-
-    @staticmethod
     def disable_ll_layered() -> bool:
         disable_ll_layered = False
         if int(os.environ.get('DEEPEP_DISABLE_LL_DISPATCH_OPT', '0')) == 1:
@@ -503,18 +490,6 @@ class Buffer:
 
         # Launch the kernel with cached or non-cached mode
         x, x_scales = x if isinstance(x, tuple) else (x, None)
-        normal_notify_dispatch_full_kernel_duration_ns_stats, \
-            normal_notify_dispatch_full_kernel_count_stats, \
-            normal_cached_notify_dispatch_full_kernel_duration_ns_stats, \
-            normal_cached_notify_dispatch_full_kernel_count_stats, \
-            normal_dispatch_final_completion_cost_stats, \
-            normal_dispatch_final_completion_sample_count_stats, \
-            normal_dispatch_final_completion_token_count_stats, \
-            normal_dispatch_rdma_recv_completion_cost_stats, \
-            normal_dispatch_rdma_recv_completion_sample_count_stats, \
-            normal_dispatch_rdma_recv_completion_token_count_stats = \
-            self._unpack_normal_stats(
-                normal_dispatch_stats, 10, "normal_dispatch_stats")
         if handle is not None:
             assert topk_idx is None and topk_weights is None
             is_token_in_rank, \
@@ -527,13 +502,7 @@ class Buffer:
                 x, x_scales, topk_idx, topk_weights, None, None, is_token_in_rank, None, num_recv_tokens, num_rdma_recv_tokens,
                 rdma_channel_prefix_matrix, recv_rdma_rank_prefix_sum,
                 gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, expert_alignment, num_worst_tokens, config,
-                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, normal_dispatch_final_completion_cost_stats,
-                normal_dispatch_final_completion_sample_count_stats, normal_dispatch_final_completion_token_count_stats,
-                normal_dispatch_rdma_recv_completion_cost_stats, normal_dispatch_rdma_recv_completion_sample_count_stats,
-                normal_dispatch_rdma_recv_completion_token_count_stats, normal_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_notify_dispatch_full_kernel_count_stats,
-                normal_cached_notify_dispatch_full_kernel_duration_ns_stats, normal_cached_notify_dispatch_full_kernel_count_stats,
-            )
+                getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, normal_dispatch_stats)
             return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)
         else:
             assert num_tokens_per_rank is not None and is_token_in_rank is not None and num_tokens_per_expert is not None
@@ -546,16 +515,7 @@ class Buffer:
                 num_tokens_per_rank, num_tokens_per_rdma_rank, is_token_in_rank, num_tokens_per_expert,
                 0, 0, None, None, None, None,
                 expert_alignment, num_worst_tokens, config, getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-                normal_dispatch_final_completion_cost_stats,
-                normal_dispatch_final_completion_sample_count_stats,
-                normal_dispatch_final_completion_token_count_stats,
-                normal_dispatch_rdma_recv_completion_cost_stats,
-                normal_dispatch_rdma_recv_completion_sample_count_stats,
-                normal_dispatch_rdma_recv_completion_token_count_stats,
-                normal_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_notify_dispatch_full_kernel_count_stats,
-                normal_cached_notify_dispatch_full_kernel_duration_ns_stats,
-                normal_cached_notify_dispatch_full_kernel_count_stats)
+                normal_dispatch_stats)
             handle = (is_token_in_rank, rdma_channel_prefix_matrix, gbl_channel_prefix_matrix, recv_rdma_channel_prefix_matrix,
                       recv_rdma_rank_prefix_sum, recv_gbl_channel_prefix_matrix, recv_gbl_rank_prefix_sum, recv_src_meta, send_rdma_head,
                       send_nvl_head)
@@ -585,22 +545,12 @@ class Buffer:
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, gbl_rank_prefix_sum, \
             src_meta, send_rdma_head, send_nvl_head = handle
         bias_0, bias_1 = Buffer._unpack_bias(bias)
-        normal_cached_notify_combine_full_kernel_duration_ns_stats, \
-            normal_cached_notify_combine_full_kernel_count_stats, \
-            normal_combine_logical_recv_completion_cost_stats, \
-            normal_combine_logical_recv_completion_sample_count_stats, \
-            normal_combine_logical_recv_completion_token_count_stats = \
-            self._unpack_normal_stats(
-                normal_combine_stats, 5, "normal_combine_stats")
 
         # Launch the kernel
         combined_x, combined_topk_weights, event = self.runtime.internode_combine(
             x, topk_weights, bias_0, bias_1, src_meta, is_combined_token_in_rank,
             rdma_channel_prefix_matrix, rdma_rank_prefix_sum, gbl_channel_prefix_matrix, send_rdma_head, send_nvl_head, config,
-            getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream,
-            normal_cached_notify_combine_full_kernel_duration_ns_stats, normal_cached_notify_combine_full_kernel_count_stats,
-            normal_combine_logical_recv_completion_cost_stats, normal_combine_logical_recv_completion_sample_count_stats,
-            normal_combine_logical_recv_completion_token_count_stats)
+            getattr(previous_event, 'event', None), async_finish, allocate_on_comm_stream, normal_combine_stats)
         return combined_x, combined_topk_weights, EventOverlap(event)
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:

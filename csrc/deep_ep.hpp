@@ -51,6 +51,29 @@ private:
 
 namespace deep_ep {
 
+struct NormalNotifyStats {
+    std::optional<torch::Tensor> duration_ns;
+    std::optional<torch::Tensor> count;
+};
+
+struct NormalCompletionStats {
+    std::optional<torch::Tensor> cost;
+    std::optional<torch::Tensor> sample_count;
+    std::optional<torch::Tensor> token_count;
+};
+
+struct NormalDispatchStats {
+    NormalNotifyStats notify;
+    NormalNotifyStats cached_notify;
+    NormalCompletionStats final_completion;
+    NormalCompletionStats rdma_recv_completion;
+};
+
+struct NormalCombineStats {
+    NormalNotifyStats cached_notify;
+    NormalCompletionStats logical_recv_completion;
+};
+
 struct Buffer {
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
 
@@ -239,16 +262,7 @@ public:
                        std::optional<EventHandle>& previous_event,
                        bool async,
                        bool allocate_on_comm_stream,
-                       const std::optional<torch::Tensor>& normal_dispatch_final_completion_cost_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_dispatch_final_completion_sample_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_dispatch_final_completion_token_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_cost_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_sample_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_dispatch_rdma_recv_completion_token_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_notify_dispatch_full_kernel_count_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_duration_ns_stats = std::nullopt,
-                       const std::optional<torch::Tensor>& normal_cached_notify_dispatch_full_kernel_count_stats = std::nullopt);
+                       const NormalDispatchStats& normal_stats = {});
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>> internode_combine(
         const torch::Tensor& x,
@@ -266,11 +280,7 @@ public:
         std::optional<EventHandle>& previous_event,
         bool async,
         bool allocate_on_comm_stream,
-        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_duration_ns_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_cached_notify_combine_full_kernel_count_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_cost_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_sample_count_stats = std::nullopt,
-        const std::optional<torch::Tensor>& normal_combine_logical_recv_completion_token_count_stats = std::nullopt);
+        const NormalCombineStats& normal_stats = {});
 
     void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
 
